@@ -1,10 +1,11 @@
-# SEC Filings Analyzer: Project Report
+# SEC Filings Insights Extraction with AI : Project Report
 
 ## Approach and Design Choices
 
 ### Project Overview
 
 The SEC Filings Analyzer is designed to help investors, analysts, and researchers extract meaningful insights from SEC filings through automated analysis and visualization. The project combines data retrieval, natural language processing, machine learning, and interactive visualization to transform complex financial documents into actionable intelligence.
+
 
 ### Architecture
 
@@ -19,6 +20,7 @@ I adopted a modular architecture with several key components:
 
 This modular approach allows for easier maintenance, testing, and future expansion of capabilities.
 
+
 ### Key Design Decisions
 
 1. **Streamlit for UI**: I chose Streamlit for its simplicity and rapid development capabilities, allowing for quick iteration of the interface without complex frontend development.
@@ -32,6 +34,7 @@ This modular approach allows for easier maintenance, testing, and future expansi
 5. **PDF Report Generation**: Added the ability to export findings as PDF reports for sharing and offline reference.
 
 6. **Agentic AI Integration**: Implemented a question-answering system that allows users to interact with the data through natural language queries.
+   
 
 ## Leveraging AI Tools
 
@@ -56,6 +59,7 @@ The project incorporates several AI technologies:
 4. **Embedding Models**:
    - Used Sentence Transformers for semantic search and similarity analysis
    - Implemented vector embeddings for efficient retrieval of relevant information
+     
 
 ## Challenges and Solutions
 
@@ -88,6 +92,7 @@ The project incorporates several AI technologies:
 **Problem**: Managing multiple AI models with different requirements and outputs was complex.
 
 **Solution**: Created a unified pipeline architecture with standardized inputs and outputs for each analysis component. Implemented fallback mechanisms when specific models are unavailable or fail.
+
 
 ## Conclusion
 
