@@ -27,7 +27,7 @@ requests==2.31.0
 
 # AI integration
 openai>=1.6.1,<2.0.0
-torch==2.0.1
+torch==2.2.0
 torchvision==0.15.2
 
 # Database
