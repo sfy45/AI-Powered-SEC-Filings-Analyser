@@ -26,10 +26,10 @@ An AI-powered tool for extracting, analyzing, and visualizing insights from SEC 
 
 ### Installation
 1. Clone the repository:
-   ```bash
-   git clone https://github.com/sfy45/AI-Powered-SEC-Filings-Analyser.git
-   cd AI-Powered-SEC-Filings-Analyser
-   ```
+```bash
+git clone https://github.com/sfy45/AI-Powered-SEC-Filings-Analyser.git
+cd AI-Powered-SEC-Filings-Analyser
+```
 
 2. Create a virtual environment:
 ```
@@ -109,3 +109,12 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 - OpenAI for AI capabilities
 - All open-source libraries used in this project
 ```
+
+## Contributing
+
+If you have a contribution to make, feel free to submit issues or pull requests. PRs are more than welcome!
+
+
+## Contact
+
+For any issues or suggestions, feel free to reach out: 📧 sophiasad1421@gmail.com
