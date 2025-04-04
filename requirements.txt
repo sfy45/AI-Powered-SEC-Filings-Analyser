@@ -1,0 +1,37 @@
+# Core dependencies
+numpy==1.24.3
+pandas==2.0.3
+matplotlib==3.7.2
+seaborn==0.12.2
+streamlit==1.25.0
+plotly==5.15.0
+wordcloud==1.9.2
+scikit-learn==1.3.0
+scipy==1.11.1
+
+# NLP libraries
+nltk==3.8.1
+spacy==3.6.1
+vaderSentiment==3.3.2
+transformers==4.31.0
+sentence-transformers==2.2.2
+langchain==0.0.267
+langchain-openai==0.0.2
+
+# SEC data retrieval
+sec-edgar-downloader==4.3.0
+beautifulsoup4==4.12.2
+requests==2.31.0
+
+# AI integration
+openai==0.27.8
+torch==2.0.1
+torchvision==0.15.2
+
+# Database
+SQLAlchemy==2.0.19
+
+# Visualization
+pyvis==0.3.2
+networkx==3.1
+
