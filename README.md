@@ -70,7 +70,7 @@ streamlit run app.py
 
 2. Access the application in your web browser at `http://localhost:8501`
 
-3. Enter a company ticker symbol, select filing type, year, and Quarter, and click "Process SEC Filing"
+3. Enter a company ticker symbol, select filing type, and year, and click "Process SEC Filing"
 
 4. Navigate through the tabs to explore different analyses and visualizations
 
@@ -105,7 +105,7 @@ AI-Powered-SEC-Filings-Analyzer/
 
 ## License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+This project is licensed under the Apache 2.0 License - see the LICENSE file for details.
 
 ## Acknowledgments
 
