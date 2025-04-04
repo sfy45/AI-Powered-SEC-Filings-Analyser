@@ -19,6 +19,7 @@ I adopted a modular architecture with several key components:
 6. **Database Layer**: SQLite database for storing processed data and analysis results
 
 This modular approach allows for easier maintenance, testing, and future expansion of capabilities.
+![Screenshot 2025-04-04 112904](https://github.com/user-attachments/assets/a2c0263d-d012-47b7-a89f-c319aa621d95)
 
 
 ### Key Design Decisions
