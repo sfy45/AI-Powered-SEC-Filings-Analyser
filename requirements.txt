@@ -1,5 +1,5 @@
 pip>=24.0
-setuptools>=70.0
+setuptools==69.0.3
 wheel
 
 # Core dependencies
@@ -30,8 +30,8 @@ requests==2.31.0
 
 # AI integration
 openai>=1.6.1,<2.0.0
-torch==2.2.0
-torchvision==0.15.2
+torch==2.1.0 
+torchvision==0.16.0
 
 # Database
 SQLAlchemy==2.0.19
