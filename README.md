@@ -110,6 +110,7 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 - All open-source libraries used in this project
 ```
 
+```
 ## Contributing
 
 If you have a contribution to make, feel free to submit issues or pull requests. PRs are more than welcome!
@@ -118,3 +119,4 @@ If you have a contribution to make, feel free to submit issues or pull requests.
 ## Contact
 
 For any issues or suggestions, feel free to reach out: 📧 sophiasad1421@gmail.com
+```
