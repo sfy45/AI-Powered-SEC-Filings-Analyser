@@ -1,3 +1,6 @@
+pip>=24.0
+setuptools>=70.0
+wheel
 
 # Core dependencies
 numpy==1.25.0
