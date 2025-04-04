@@ -1,4 +1,4 @@
-# AI-Powered-SEC-Filings-Analyser
+# 📊 AI Powered SEC Filings Analyser
 
 
 An AI-powered tool for extracting, analyzing, and visualizing insights from SEC filings using natural language processing and machine learning techniques.
