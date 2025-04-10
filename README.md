@@ -26,7 +26,7 @@ An AI-powered tool for extracting, analyzing, and visualizing insights from SEC 
 
 
 ## 🌐 Demo
-🔗 **Live App:** [AI-Powered-SEC-Filings-Analyser](https://huggingface.co/spaces/sfy45/SEC-FILINGS-INSIGHTS-EXTRACTION-WITH-AI)
+🔗 **Live App:** [SEC-FILINGS-INSIGHTS-EXTRACTION-WITH-AI](https://huggingface.co/spaces/sfy45/SEC-FILINGS-INSIGHTS-EXTRACTION-WITH-AI)
 
 ## Setup
 
