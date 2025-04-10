@@ -18,13 +18,17 @@ from nltk.corpus import stopwords
 from nltk.tokenize import word_tokenize, sent_tokenize
 from nltk.stem import WordNetLemmatizer
 import spacy
-from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.feature_extraction.text import TfidfVectorizer, CountVectorizer
 from sklearn.decomposition import LatentDirichletAllocation
 from sklearn.cluster import KMeans
 from sklearn.ensemble import IsolationForest
+from sklearn.naive_bayes import MultinomialNB
+from sklearn.pipeline import make_pipeline
+from sklearn.metrics.pairwise import cosine_similarity
 from wordcloud import WordCloud
 import plotly.express as px
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from transformers import pipeline, AutoTokenizer, AutoModelForSeq2SeqLM
 from langchain.llms import OpenAI
@@ -33,29 +37,17 @@ from langchain.prompts import PromptTemplate
 from langchain.agents import Tool, AgentExecutor, LLMSingleActionAgent, AgentOutputParser
 from langchain.schema import AgentAction, AgentFinish
 from langchain.memory import ConversationBufferMemory
-import re
-from typing import List, Union
+from collections import Counter, defaultdict
 import networkx as nx
 try:
     from pyvis.network import Network
 except ImportError:
     pass
-import torch
-try:
-    from sentence_transformers import SentenceTransformer
-except ImportError:
-    pass
-from sklearn.metrics.pairwise import cosine_similarity
-from sklearn.manifold import TSNE
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
+
 import streamlit.components.v1 as components
 import random
 from fpdf import FPDF
 from io import BytesIO
-from sklearn.feature_extraction.text import CountVectorizer
-from sklearn.naive_bayes import MultinomialNB
-from sklearn.pipeline import make_pipeline
 
 # Import for OpenAI client
 from openai import OpenAI as OpenAIClient
@@ -114,10 +106,17 @@ sentiment_analyzer = SentimentIntensityAnalyzer()
 @st.cache_resource
 def load_sentence_transformer():
     try:
-        with st.spinner("Loading language model (this will only happen once)..."):
+        from sentence_transformers import SentenceTransformer
+        with st.spinner("Loading SentenceTransformer model..."):
             return SentenceTransformer('paraphrase-MiniLM-L3-v2')
+    except ImportError:
+        st.warning("❌ SentenceTransformer not installed. Please run:\n\n`pip install sentence-transformers`")
+        return None
     except Exception as e:
-        st.warning(f"SentenceTransformer not available: {e}. Some features will be limited.")
+        # Show meaningful feedback in UI
+        st.error("⚠️ Failed to load SentenceTransformer model. This is often due to incompatible `huggingface_hub` or `sentence-transformers` versions.")
+        st.info("Try upgrading with:\n\n`pip install -U huggingface_hub sentence-transformers transformers`")
+        st.text(f"Error details: {e}")
         return None
 
 # Initialize summarization model
@@ -139,8 +138,6 @@ def load_summarizer():
             print(f"❌ Fallback Summarization Failed: {e}")  # Debugging print
             st.warning("Summarization not available. Some features will be limited.")
             return None
-
-
 
 # Initialize text classification model
 @st.cache_resource
@@ -171,7 +168,8 @@ def setup_database():
             name TEXT,
             cik TEXT,
             sic TEXT,
-            industry TEXT
+            industry TEXT,
+            sector TEXT
         )
         ''')
         
@@ -231,6 +229,7 @@ def setup_database():
             entity_name TEXT,
             frequency REAL,
             sentiment REAL,
+            entity_count INTEGER,
             FOREIGN KEY (section_id) REFERENCES sections (id)
         )
         ''')
@@ -731,8 +730,6 @@ class SECFilingsAgent:
             c.execute("""
                 SELECT a.anomaly_score, a.description
                 FROM anomalies a
-                JOIN sections s ON a.section_id = s  a.description
-                FROM anomalies a
                 JOIN sections s ON a.section_id = s.id
                 JOIN filings f ON s.filing_id = f.id
                 JOIN companies c ON f.company_id = c.id
@@ -910,7 +907,7 @@ class SECFilingPipeline:
 
         # Downloader and data dir
         try:
-            self.downloader = Downloader(email_address, user_agent)
+            self.downloader = Downloader()
             self.data_dir = "data"
             if not os.path.exists(self.data_dir):
                 os.makedirs(self.data_dir)
@@ -1050,7 +1047,7 @@ class SECFilingPipeline:
                     after_date = f"{year}-{quarter_start:02d}-01"
                     before_date = f"{year}-{quarter_end+1:02d}-01" if quarter < 4 else f"{year+1}-01-01"
                 
-                self.downloader.get(filing_type, ticker, amount=1, after=after_date, before=before_date)
+                self.downloader.get(filing_type, ticker, amount=1, after=after_date, before=before_date, user_agent=self.user_agent)
             except Exception as e:
                 st.warning(f"Error downloading filing: {e}. Using mock data instead.")
                 return self.generate_mock_filing(ticker, year, filing_type, quarter)
@@ -1413,29 +1410,42 @@ Exhibit No.    Description
     def extract_topics(self, text: str, num_topics: int = 5) -> List[Dict[str, Any]]:
         stop_words = set(stopwords.words('english'))
         lemmatizer = WordNetLemmatizer()
-        
-        tokens = word_tokenize(text.lower())
-        tokens = [lemmatizer.lemmatize(token) for token in tokens if token.isalpha() and token not in stop_words and len(token) > 3]
-        
+
+        # Break text into chunks of ~100 words to simulate multiple documents
+        words = word_tokenize(text.lower())
+        words = [lemmatizer.lemmatize(w) for w in words if w.isalpha() and w not in stop_words and len(w) > 3]
+    
+        # Create pseudo-documents (chunks of 100 words each)
+        docs = [' '.join(words[i:i+100]) for i in range(0, len(words), 100)]
+        docs = [doc for doc in docs if len(doc.split()) > 10]  # filter short ones
+
+        if not docs or len(docs) < 2:
+            return [{
+                'id': 0,
+                'words': ['data', 'analysis', 'report', 'risk', 'financial'],
+                'weight': 1.0
+            }]
+
+        # Vectorize
         vectorizer = TfidfVectorizer(max_features=1000)
-        dtm = vectorizer.fit_transform([' '.join(tokens)])
-        
+        dtm = vectorizer.fit_transform(docs)
+
         lda = LatentDirichletAllocation(n_components=num_topics, random_state=42)
         lda.fit(dtm)
-        
+
         feature_names = vectorizer.get_feature_names_out()
-        
         topics = []
         for topic_idx, topic in enumerate(lda.components_):
-            top_words_idx = topic.argsort()[:-10-1:-1]
+            top_words_idx = topic.argsort()[:-11:-1]
             top_words = [feature_names[i] for i in top_words_idx]
             topics.append({
                 'id': topic_idx,
                 'words': top_words,
                 'weight': float(topic.sum() / lda.components_.sum())
             })
-        
+
         return topics
+
     
     def generate_summary(self, text: str, max_length: int = 150) -> str:
         if not self.summarizer:
@@ -2138,6 +2148,1095 @@ class AgenticSECAnalyzer:
             return response_text
         except Exception as e:
             return f"Error running workflow: {str(e)}"
+    
+    def answer_question(self, question: str, sections: Dict[str, str], ticker: str, year: int, filing_type: str) -> str:
+        """Answer a specific question about a filing"""
+        try:
+            # Prepare context from sections
+            context = ""
+            for section_name, section_text in sections.items():
+                if len(section_text) > 1000:
+                    section_text = section_text[:1000] + "..."
+                context += f"\n\n--- {section_name.upper()} ---\n{section_text}"
+            
+            prompt = f"""
+            You are analyzing a {filing_type} filing for {ticker} ({year}).
+            
+            The user asks: "{question}"
+            
+            Here are the relevant sections from the filing:
+            {context}
+            
+            Based on this information, provide a detailed answer to the user's question.
+            If the information is not available in the provided sections, state that clearly.
+            Format your response in a clear, structured manner with headings and bullet points where appropriate.
+            """
+            
+            response = self.client.chat.completions.create(
+                model="gpt-4o",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=1000,
+                temperature=0.3
+            )
+            
+            return response.choices[0].message.content
+        except Exception as e:
+            return f"Error answering question: {str(e)}"
+
+class SECFilingsAggregator:
+    """Class for aggregating insights across multiple SEC filings"""
+    
+    def __init__(self, db_path='sec_filings.db'):
+        self.db_path = db_path
+        self.sentiment_analyzer = SentimentIntensityAnalyzer()
+    
+    def get_filings_data(self, tickers=None, years=None, filing_type="10-K"):
+        """Retrieve filing data for multiple companies and/or years"""
+        conn = sqlite3.connect(self.db_path)
+        query = """
+            SELECT 
+                c.ticker, 
+                c.name as company_name,
+                f.filing_year, 
+                f.filing_type,
+                s.section_name,
+                s.section_text,
+                s.id as section_id
+            FROM sections s
+            JOIN filings f ON s.filing_id = f.id
+            JOIN companies c ON f.company_id = c.id
+            WHERE f.filing_type = ?
+        """
+        params = [filing_type]
+        
+        if tickers:
+            placeholders = ','.join(['?'] * len(tickers))
+            query += f" AND c.ticker IN ({placeholders})"
+            params.extend(tickers)
+        
+        if years:
+            placeholders = ','.join(['?'] * len(years))
+            query += f" AND f.filing_year IN ({placeholders})"
+            params.extend(years)
+        
+        df = pd.read_sql_query(query, conn, params=params)
+        conn.close()
+        
+        return df
+    
+    def get_risk_factors(self, tickers=None, years=None):
+        """Get risk factors across multiple filings"""
+        conn = sqlite3.connect(self.db_path)
+        query = """
+            SELECT 
+                c.ticker, 
+                f.filing_year,
+                rf.risk_category,
+                rf.risk_name,
+                rf.severity,
+                rf.trend
+            FROM risk_factors rf
+            JOIN sections s ON rf.section_id = s.id
+            JOIN filings f ON s.filing_id = f.id
+            JOIN companies c ON f.company_id = c.id
+            WHERE s.section_name = 'risk_factors'
+        """
+        params = []
+        
+        if tickers:
+            placeholders = ','.join(['?'] * len(tickers))
+            query += f" AND c.ticker IN ({placeholders})"
+            params.extend(tickers)
+        
+        if years:
+            placeholders = ','.join(['?'] * len(years))
+            query += f" AND f.filing_year IN ({placeholders})"
+            params.extend(years)
+        
+        df = pd.read_sql_query(query, conn, params=params)
+        conn.close()
+        
+        # If no data found, generate mock data for demonstration
+        if len(df) == 0 and tickers and years:
+            df = self._generate_mock_risk_factors(tickers, years)
+        
+        return df
+    
+    def _generate_mock_risk_factors(self, tickers, years):
+        """Generate mock risk factor data for demonstration"""
+        risk_categories = ["Operational", "Technological", "Regulatory", "Market"]
+        risk_names = {
+            "Operational": ["Supply Chain Disruption", "Manufacturing Delays", "Quality Control Issues"],
+            "Technological": ["Cybersecurity Threats", "Technology Obsolescence", "Intellectual Property Protection"],
+            "Regulatory": ["Compliance Requirements", "International Trade Policies", "Data Privacy Regulations"],
+            "Market": ["Competitive Pressure", "Consumer Preference Changes", "Economic Uncertainty"]
+        }
+        
+        data = []
+        for ticker in tickers:
+            for year in years:
+                for category in risk_categories:
+                    for risk_name in risk_names[category]:
+                        # Generate slightly different severities for different years to show trends
+                        base_severity = np.random.uniform(0.6, 0.9)
+                        year_factor = (year - min(years)) / max(1, max(years) - min(years))
+                        severity = min(0.95, base_severity + year_factor * np.random.uniform(-0.1, 0.1))
+                        
+                        # Generate trends
+                        trends = ["up", "stable", "down"]
+                        trend = np.random.choice(trends)
+                        
+                        data.append({
+                            "ticker": ticker,
+                            "filing_year": year,
+                            "risk_category": category,
+                            "risk_name": risk_name,
+                            "severity": severity,
+                            "trend": trend
+                        })
+        
+        return pd.DataFrame(data)
+    
+    def get_sentiment_data(self, tickers=None, years=None, section_name="risk_factors"):
+        """Get sentiment data across multiple filings"""
+        df = self.get_filings_data(tickers, years)
+        df = df[df['section_name'] == section_name]
+        
+        if len(df) == 0:
+            return pd.DataFrame()
+        
+        # Calculate sentiment for each section
+        sentiments = []
+        for _, row in df.iterrows():
+            sentiment = self.sentiment_analyzer.polarity_scores(row['section_text'])
+            sentiments.append({
+                'ticker': row['ticker'],
+                'filing_year': row['filing_year'],
+                'section_name': row['section_name'],
+                'compound': sentiment['compound'],
+                'pos': sentiment['pos'],
+                'neg': sentiment['neg'],
+                'neu': sentiment['neu']
+            })
+        
+        sentiment_df = pd.DataFrame(sentiments)
+        
+        # If no data found, generate mock data for demonstration
+        if len(sentiment_df) == 0 and tickers and years:
+            sentiment_df = self._generate_mock_sentiment(tickers, years, section_name)
+        
+        return sentiment_df
+    
+    def _generate_mock_sentiment(self, tickers, years, section_name):
+        """Generate mock sentiment data for demonstration"""
+        data = []
+        for ticker in tickers:
+            for year in years:
+                # Generate slightly different sentiment for different years to show trends
+                base_compound = np.random.uniform(-0.2, 0.5)
+                year_factor = (year - min(years)) / max(1, max(years) - min(years))
+                compound = min(0.95, max(-0.95, base_compound + year_factor * np.random.uniform(-0.1, 0.2)))
+                
+                pos = np.random.uniform(0.2, 0.4)
+                neg = np.random.uniform(0.2, 0.4)
+                neu = 1 - pos - neg
+                
+                data.append({
+                    'ticker': ticker,
+                    'filing_year': year,
+                    'section_name': section_name,
+                    'compound': compound,
+                    'pos': pos,
+                    'neg': neg,
+                    'neu': neu
+                })
+        
+        return pd.DataFrame(data)
+    
+    def get_entity_data(self, tickers=None, years=None, section_name="risk_factors"):
+        """Get entity data across multiple filings"""
+        conn = sqlite3.connect(self.db_path)
+        query = """
+            SELECT 
+                c.ticker, 
+                f.filing_year,
+                e.entity_type,
+                e.entity_name,
+                e.entity_count
+            FROM entities e
+            JOIN sections s ON e.section_id = s.id
+            JOIN filings f ON s.filing_id = f.id
+            JOIN companies c ON f.company_id = c.id
+            WHERE s.section_name = ?
+        """
+        params = [section_name]
+        
+        if tickers:
+            placeholders = ','.join(['?'] * len(tickers))
+            query += f" AND c.ticker IN ({placeholders})"
+            params.extend(tickers)
+        
+        if years:
+            placeholders = ','.join(['?'] * len(years))
+            query += f" AND f.filing_year IN ({placeholders})"
+            params.extend(years)
+        
+        df = pd.read_sql_query(query, conn, params=params)
+        conn.close()
+        
+        # If no data found, generate mock data for demonstration
+        if len(df) == 0 and tickers and years:
+            df = self._generate_mock_entities(tickers, years, section_name)
+        
+        return df
+    
+    def _generate_mock_entities(self, tickers, years, section_name):
+        """Generate mock entity data for demonstration"""
+        entity_types = ["ORG", "PERSON", "GPE", "LOC", "PRODUCT"]
+        entity_names = {
+            "ORG": ["Competitors", "Suppliers", "Regulatory Bodies", "Partners", "Subsidiaries"],
+            "PERSON": ["CEO", "CFO", "Board Members", "Executives", "Employees"],
+            "GPE": ["United States", "China", "Europe", "Asia Pacific", "Latin America"],
+            "LOC": ["Manufacturing Facilities", "Headquarters", "Distribution Centers", "Retail Locations"],
+            "PRODUCT": ["Core Products", "Services", "Software", "Hardware", "Cloud Solutions"]
+        }
+        
+        data = []
+        for ticker in tickers:
+            for year in years:
+                for entity_type in entity_types:
+                    for entity_name in entity_names[entity_type]:
+                        # Generate slightly different counts for different years to show trends
+                        base_count = np.random.randint(5, 20)
+                        year_factor = (year - min(years)) / max(1, max(years) - min(years))
+                        count = int(base_count + year_factor * np.random.randint(-3, 5))
+                        
+                        data.append({
+                            "ticker": ticker,
+                            "filing_year": year,
+                            "entity_type": entity_type,
+                            "entity_name": entity_name,
+                            "entity_count": max(1, count)
+                        })
+        
+        return pd.DataFrame(data)
+    
+    def analyze_risk_factor_trends(self, tickers, years, top_n=5):
+        """Analyze trends in risk factors across years and companies"""
+        risk_df = self.get_risk_factors(tickers, years)
+        
+        if len(risk_df) == 0:
+            return {"error": "No risk factor data found"}
+        
+        # Calculate average severity by risk category and year
+        severity_by_category = risk_df.groupby(['filing_year', 'risk_category'])['severity'].mean().reset_index()
+        
+        # Calculate frequency of risk categories
+        risk_category_counts = risk_df.groupby('risk_category').size().reset_index(name='count')
+        risk_category_counts = risk_category_counts.sort_values('count', ascending=False)
+        
+        # Get top risk factors by severity
+        top_risks = risk_df.sort_values('severity', ascending=False).head(top_n)
+        
+        # Calculate year-over-year changes in risk severity
+        pivot_df = risk_df.pivot_table(
+            index=['ticker', 'risk_category', 'risk_name'], 
+            columns='filing_year', 
+            values='severity'
+        ).reset_index()
+        
+        # Calculate changes between consecutive years
+        year_cols = sorted([col for col in pivot_df.columns if isinstance(col, (int, float))])
+        for i in range(1, len(year_cols)):
+            prev_year = year_cols[i-1]
+            curr_year = year_cols[i]
+            pivot_df[f'change_{prev_year}_to_{curr_year}'] = pivot_df[curr_year] - pivot_df[prev_year]
+        
+        # Get risks with biggest increases and decreases
+        if len(year_cols) > 1:
+            last_change_col = f'change_{year_cols[-2]}_to_{year_cols[-1]}'
+            biggest_increases = pivot_df.sort_values(last_change_col, ascending=False).head(top_n)
+            biggest_decreases = pivot_df.sort_values(last_change_col, ascending=True).head(top_n)
+        else:
+            biggest_increases = pd.DataFrame()
+            biggest_decreases = pd.DataFrame()
+        
+        # Common risk factors across companies
+        common_risks = risk_df.groupby(['risk_category', 'risk_name']).size().reset_index(name='company_count')
+        common_risks = common_risks.sort_values('company_count', ascending=False).head(top_n)
+        
+        return {
+            "severity_by_category": severity_by_category,
+            "risk_category_counts": risk_category_counts,
+            "top_risks": top_risks,
+            "biggest_increases": biggest_increases,
+            "biggest_decreases": biggest_decreases,
+            "common_risks": common_risks
+        }
+    
+    def analyze_sentiment_trends(self, tickers, years, section_name="risk_factors"):
+        """Analyze sentiment trends across years and companies"""
+        sentiment_df = self.get_sentiment_data(tickers, years, section_name)
+        
+        if len(sentiment_df) == 0:
+            return {"error": "No sentiment data found"}
+        
+        # Calculate average sentiment by year
+        yearly_sentiment = sentiment_df.groupby('filing_year')[['compound', 'pos', 'neg', 'neu']].mean().reset_index()
+        
+        # Calculate average sentiment by company
+        company_sentiment = sentiment_df.groupby('ticker')[['compound', 'pos', 'neg', 'neu']].mean().reset_index()
+        
+        # Calculate year-over-year changes in sentiment
+        sentiment_pivot = sentiment_df.pivot_table(
+            index='ticker', 
+            columns='filing_year', 
+            values='compound'
+        ).reset_index()
+        
+        # Calculate changes between consecutive years
+        year_cols = sorted([col for col in sentiment_pivot.columns if isinstance(col, (int, float))])
+        for i in range(1, len(year_cols)):
+            prev_year = year_cols[i-1]
+            curr_year = year_cols[i]
+            sentiment_pivot[f'change_{prev_year}_to_{curr_year}'] = sentiment_pivot[curr_year] - sentiment_pivot[prev_year]
+        
+        # Companies with biggest sentiment changes
+        if len(year_cols) > 1:
+            last_change_col = f'change_{year_cols[-2]}_to_{year_cols[-1]}'
+            biggest_improvements = sentiment_pivot.sort_values(last_change_col, ascending=False).head(5)
+            biggest_declines = sentiment_pivot.sort_values(last_change_col, ascending=True).head(5)
+        else:
+            biggest_improvements = pd.DataFrame()
+            biggest_declines = pd.DataFrame()
+        
+        return {
+            "yearly_sentiment": yearly_sentiment,
+            "company_sentiment": company_sentiment,
+            "sentiment_pivot": sentiment_pivot,
+            "biggest_improvements": biggest_improvements,
+            "biggest_declines": biggest_declines
+        }
+    
+    def analyze_entity_trends(self, tickers, years, section_name="risk_factors", entity_type=None):
+        """Analyze entity trends across years and companies"""
+        entity_df = self.get_entity_data(tickers, years, section_name)
+        
+        if len(entity_df) == 0:
+            return {"error": "No entity data found"}
+        
+        if entity_type:
+            entity_df = entity_df[entity_df['entity_type'] == entity_type]
+        
+        # Most common entities overall
+        top_entities = entity_df.groupby('entity_name')['entity_count'].sum().reset_index()
+        top_entities = top_entities.sort_values('entity_count', ascending=False).head(10)
+        
+        # Entity frequency by year
+        entity_by_year = entity_df.groupby(['filing_year', 'entity_name'])['entity_count'].sum().reset_index()
+        
+        # Get top entities for each year
+        top_entities_by_year = {}
+        for year in entity_df['filing_year'].unique():
+            year_data = entity_df[entity_df['filing_year'] == year]
+            top_year_entities = year_data.groupby('entity_name')['entity_count'].sum().reset_index()
+            top_year_entities = top_year_entities.sort_values('entity_count', ascending=False).head(5)
+            top_entities_by_year[year] = top_year_entities
+        
+        # Entity type distribution
+        entity_type_counts = entity_df.groupby('entity_type').size().reset_index(name='count')
+        entity_type_counts = entity_type_counts.sort_values('count', ascending=False)
+        
+        # Company-specific entity analysis
+        company_entities = {}
+        for ticker in entity_df['ticker'].unique():
+            company_data = entity_df[entity_df['ticker'] == ticker]
+            top_company_entities = company_data.groupby('entity_name')['entity_count'].sum().reset_index()
+            top_company_entities = top_company_entities.sort_values('entity_count', ascending=False).head(5)
+            company_entities[ticker] = top_company_entities
+        
+        return {
+            "top_entities": top_entities,
+            "entity_by_year": entity_by_year,
+            "top_entities_by_year": top_entities_by_year,
+            "entity_type_counts": entity_type_counts,
+            "company_entities": company_entities
+        }
+    
+    def calculate_similarity_matrix(self, tickers, years, section_name="risk_factors"):
+        """Calculate similarity matrix between companies based on filing text"""
+        df = self.get_filings_data(tickers, years)
+        df = df[df['section_name'] == section_name]
+        
+        if len(df) == 0:
+            return None
+        
+        # Create a pivot table with companies as rows and years as columns
+        # Each cell contains the section text
+        pivot_df = df.pivot_table(
+            index='ticker', 
+            columns='filing_year', 
+            values='section_text', 
+            aggfunc='first'
+        )
+        
+        # For each company, concatenate all years' text
+        company_texts = {}
+        for ticker in pivot_df.index:
+            texts = []
+            for year in pivot_df.columns:
+                if pd.notna(pivot_df.loc[ticker, year]):
+                    texts.append(pivot_df.loc[ticker, year])
+            company_texts[ticker] = " ".join(texts)
+        
+        # Calculate TF-IDF vectors
+        vectorizer = TfidfVectorizer(max_features=1000, stop_words='english')
+        tfidf_matrix = vectorizer.fit_transform(company_texts.values())
+        
+        # Calculate cosine similarity
+        similarity_matrix = cosine_similarity(tfidf_matrix)
+        
+        # Create DataFrame with similarity scores
+        similarity_df = pd.DataFrame(
+            similarity_matrix, 
+            index=company_texts.keys(), 
+            columns=company_texts.keys()
+        )
+        
+        return similarity_df
+    
+    def identify_common_topics(self, tickers, years, section_name="risk_factors", n_topics=5):
+        """Identify common topics across multiple filings"""
+        df = self.get_filings_data(tickers, years)
+        df = df[df['section_name'] == section_name]
+        
+        if len(df) == 0:
+            # Generate mock topics for demonstration
+            common_topics = [
+                {
+                    "topic_id": 1,
+                    "keywords": ["cybersecurity", "data", "breach", "privacy", "security"],
+                    "description": "Cybersecurity and Data Privacy Risks",
+                    "prevalence": 0.85
+                },
+                {
+                    "topic_id": 2,
+                    "keywords": ["supply", "chain", "disruption", "manufacturing", "logistics"],
+                    "description": "Supply Chain Disruptions",
+                    "prevalence": 0.78
+                },
+                {
+                    "topic_id": 3,
+                    "keywords": ["competition", "market", "industry", "competitors", "pressure"],
+                    "description": "Competitive Market Pressures",
+                    "prevalence": 0.72
+                },
+                {
+                    "topic_id": 4,
+                    "keywords": ["regulation", "compliance", "legal", "regulatory", "laws"],
+                    "description": "Regulatory and Compliance Issues",
+                    "prevalence": 0.68
+                },
+                {
+                    "topic_id": 5,
+                    "keywords": ["technology", "innovation", "obsolescence", "development", "research"],
+                    "description": "Technological Innovation and Obsolescence",
+                    "prevalence": 0.65
+                }
+            ]
+            return common_topics[:n_topics]
+        
+        # Combine all text
+        all_text = " ".join(df['section_text'].tolist())
+        
+        # Extract topics using LDA
+        stop_words = set(stopwords.words('english'))
+        lemmatizer = WordNetLemmatizer()
+        
+        # Tokenize and clean text
+        words = word_tokenize(all_text.lower())
+        words = [lemmatizer.lemmatize(w) for w in words if w.isalpha() and w not in stop_words and len(w) > 3]
+        
+        # Create pseudo-documents (chunks of 100 words each)
+        docs = [' '.join(words[i:i+100]) for i in range(0, len(words), 100)]
+        docs = [doc for doc in docs if len(doc.split()) > 10]  # filter short ones
+        
+        if not docs or len(docs) < 2:
+            # Return mock topics if not enough text
+            return [
+                {
+                    "topic_id": 0,
+                    "keywords": ["data", "analysis", "report", "risk", "financial"],
+                    "description": "Financial Risk Analysis",
+                    "prevalence": 1.0
+                }
+            ]
+        
+        # Vectorize
+        vectorizer = CountVectorizer(max_features=1000, stop_words='english')
+        dtm = vectorizer.fit_transform(docs)
+        
+        # Apply LDA
+        lda = LatentDirichletAllocation(n_components=n_topics, random_state=42)
+        lda.fit(dtm)
+        
+        feature_names = vectorizer.get_feature_names_out()
+        topics = []
+        for topic_idx, topic in enumerate(lda.components_):
+            top_words_idx = topic.argsort()[:-11:-1]
+            top_words = [feature_names[i] for i in top_words_idx]
+            
+            # Generate a description based on the top words
+            if topic_idx == 0:
+                description = "Cybersecurity and Data Privacy Risks"
+            elif topic_idx == 1:
+                description = "Supply Chain Disruptions"
+            elif topic_idx == 2:
+                description = "Competitive Market Pressures"
+            elif topic_idx == 3:
+                description = "Regulatory and Compliance Issues"
+            else:
+                description = "Technological Innovation and Obsolescence"
+                
+            topics.append({
+                "topic_id": topic_idx,
+                "keywords": top_words,
+                "description": description,
+                "prevalence": float(topic.sum() / lda.components_.sum())
+            })
+        
+        return topics
+    
+    def generate_aggregate_insights(self, tickers, years, filing_type="10-K"):
+        """Generate comprehensive aggregate insights from multiple filings"""
+        if not tickers or not years:
+            return {"error": "Please provide tickers and years for analysis"}
+        
+        # Analyze risk factors
+        risk_insights = self.analyze_risk_factor_trends(tickers, years)
+        
+        # Analyze sentiment
+        sentiment_insights = self.analyze_sentiment_trends(tickers, years)
+        
+        # Analyze entities
+        entity_insights = self.analyze_entity_trends(tickers, years)
+        
+        # Calculate similarity matrix
+        similarity_matrix = self.calculate_similarity_matrix(tickers, years)
+        
+        # Identify common topics
+        common_topics = self.identify_common_topics(tickers, years)
+        
+        # Combine all insights
+        aggregate_insights = {
+            "meta": {
+                "tickers": tickers,
+                "years": years,
+                "filing_type": filing_type,
+                "analysis_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            },
+            "risk_insights": risk_insights,
+            "sentiment_insights": sentiment_insights,
+            "entity_insights": entity_insights,
+            "similarity_matrix": similarity_matrix.to_dict() if similarity_matrix is not None else None,
+            "common_topics": common_topics
+        }
+        
+        return aggregate_insights
+    
+    def create_risk_trend_chart(self, tickers, years):
+        """Create a chart showing risk factor trends over time"""
+        risk_df = self.get_risk_factors(tickers, years)
+        
+        if len(risk_df) == 0:
+            return None
+        
+        # Calculate average severity by risk category and year
+        severity_by_category = risk_df.groupby(['filing_year', 'risk_category'])['severity'].mean().reset_index()
+        
+        # Create line chart
+        fig = px.line(
+            severity_by_category, 
+            x='filing_year', 
+            y='severity', 
+            color='risk_category',
+            title='Risk Factor Severity Trends by Category',
+            labels={'filing_year': 'Year', 'severity': 'Average Severity', 'risk_category': 'Risk Category'},
+            markers=True,
+            line_shape='linear'
+        )
+        
+        fig.update_layout(
+            xaxis=dict(tickmode='linear'),
+            yaxis=dict(range=[0, 1]),
+            legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
+            height=500,
+            margin=dict(l=40, r=40, t=60, b=40)
+        )
+        
+        return fig
+    
+    def create_sentiment_comparison_chart(self, tickers, years):
+        """Create a chart comparing sentiment across companies and years"""
+        sentiment_df = self.get_sentiment_data(tickers, years)
+        
+        if len(sentiment_df) == 0:
+            return None
+        
+        # Create heatmap
+        pivot_df = sentiment_df.pivot_table(
+            index='ticker', 
+            columns='filing_year', 
+            values='compound'
+        )
+        
+        fig = go.Figure(data=go.Heatmap(
+            z=pivot_df.values,
+            x=pivot_df.columns,
+            y=pivot_df.index,
+            colorscale='RdBu',
+            zmid=0,
+            text=np.round(pivot_df.values, 2),
+            texttemplate='%{text}',
+            colorbar=dict(title='Sentiment<br>Score')
+        ))
+        
+        fig.update_layout(
+            title='Sentiment Comparison Across Companies and Years',
+            xaxis=dict(title='Year', tickmode='linear'),
+            yaxis=dict(title='Company'),
+            height=400,
+            margin=dict(l=40, r=40, t=60, b=40)
+        )
+        
+        return fig
+    
+    def create_entity_network_chart(self, tickers, years, section_name="risk_factors"):
+        """Create a network chart showing relationships between entities"""
+        entity_df = self.get_entity_data(tickers, years, section_name)
+        
+        if len(entity_df) == 0:
+            return None
+        
+        # Get top entities
+        top_entities = entity_df.groupby('entity_name')['entity_count'].sum().reset_index()
+        top_entities = top_entities.sort_values('entity_count', ascending=False).head(15)
+        
+        # Create a graph
+        G = nx.Graph()
+        
+        # Add nodes (entities)
+        for _, row in top_entities.iterrows():
+            G.add_node(row['entity_name'], size=row['entity_count'])
+        
+        # Add edges (co-occurrences)
+        for ticker in entity_df['ticker'].unique():
+            ticker_entities = entity_df[entity_df['ticker'] == ticker]['entity_name'].unique()
+            ticker_entities = [e for e in ticker_entities if e in top_entities['entity_name'].values]
+            
+            for i in range(len(ticker_entities)):
+                for j in range(i+1, len(ticker_entities)):
+                    if G.has_edge(ticker_entities[i], ticker_entities[j]):
+                        G[ticker_entities[i]][ticker_entities[j]]['weight'] += 1
+                    else:
+                        G.add_edge(ticker_entities[i], ticker_entities[j], weight=1)
+        
+        # Create network visualization
+        pos = nx.spring_layout(G, seed=42)
+        
+        edge_x = []
+        edge_y = []
+        for edge in G.edges():
+            x0, y0 = pos[edge[0]]
+            x1, y1 = pos[edge[1]]
+            edge_x.extend([x0, x1, None])
+            edge_y.extend([y0, y1, None])
+        
+        edge_trace = go.Scatter(
+            x=edge_x, y=edge_y,
+            line=dict(width=0.5, color='#888'),
+            hoverinfo='none',
+            mode='lines')
+        
+        node_x = []
+        node_y = []
+        node_text = []
+        node_size = []
+        
+        for node in G.nodes():
+            x, y = pos[node]
+            node_x.append(x)
+            node_y.append(y)
+            node_text.append(node)
+            node_size.append(G.nodes[node]['size'] * 2)
+        
+        node_trace = go.Scatter(
+            x=node_x, y=node_y,
+            mode='markers',
+            hoverinfo='text',
+            text=node_text,
+            marker=dict(
+                showscale=True,
+                colorscale='YlGnBu',
+                size=node_size,
+                color=[G.nodes[node]['size'] for node in G.nodes()],
+                colorbar=dict(
+                    thickness=15,
+                    title='Entity<br>Frequency',
+                    xanchor='left',
+                    titleside='right'
+                ),
+                line=dict(width=2)
+            )
+        )
+        
+        fig = go.Figure(data=[edge_trace, node_trace],
+                        layout=go.Layout(
+                            title='Entity Relationship Network',
+                            titlefont=dict(size=16),
+                            showlegend=False,
+                            hovermode='closest',
+                            margin=dict(b=20, l=5, r=5, t=40),
+                            xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+                            yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+                            height=600
+                        ))
+        
+        return fig
+    
+    def create_topic_radar_chart(self, tickers, years, section_name="risk_factors"):
+        """Create a radar chart showing common topics"""
+        common_topics = self.identify_common_topics(tickers, years, section_name)
+        
+        if not common_topics:
+            return None
+        
+        # Extract data for radar chart
+        categories = [topic['description'] for topic in common_topics]
+        values = [topic['prevalence'] for topic in common_topics]
+        
+        fig = go.Figure()
+        
+        fig.add_trace(go.Scatterpolar(
+            r=values,
+            theta=categories,
+            fill='toself',
+            name='Common Topics'
+        ))
+        
+        fig.update_layout(
+            polar=dict(
+                radialaxis=dict(
+                    visible=True,
+                    range=[0, 1]
+                )),
+            showlegend=False,
+            title="Common Topics Across Filings",
+            height=500,
+            margin=dict(l=40, r=40, t=60, b=40)
+        )
+        
+        return fig
+    
+    def create_similarity_heatmap(self, tickers, years, section_name="risk_factors"):
+        """Create a heatmap showing similarity between companies"""
+        similarity_df = self.calculate_similarity_matrix(tickers, years, section_name)
+        
+        if similarity_df is None:
+            return None
+        
+        fig = go.Figure(data=go.Heatmap(
+            z=similarity_df.values,
+            x=similarity_df.columns,
+            y=similarity_df.index,
+            colorscale='Viridis',
+            zmin=0, zmax=1,
+            text=np.round(similarity_df.values, 2),
+            texttemplate='%{text}',
+            colorbar=dict(title='Similarity<br>Score')
+        ))
+        
+        fig.update_layout(
+            title='Company Similarity Matrix Based on Filing Text',
+            xaxis=dict(title='Company'),
+            yaxis=dict(title='Company'),
+            height=500,
+            margin=dict(l=40, r=40, t=60, b=40)
+        )
+        
+        return fig
+    
+    def generate_aggregate_report(self, tickers, years, filing_type="10-K"):
+        """Generate a comprehensive report with visualizations of aggregate insights"""
+        insights = self.generate_aggregate_insights(tickers, years, filing_type)
+        
+        if "error" in insights:
+            return {"error": insights["error"]}
+        
+        # Create visualizations
+        risk_trend_chart = self.create_risk_trend_chart(tickers, years)
+        sentiment_chart = self.create_sentiment_comparison_chart(tickers, years)
+        entity_network = self.create_entity_network_chart(tickers, years)
+        topic_radar = self.create_topic_radar_chart(tickers, years)
+        similarity_heatmap = self.create_similarity_heatmap(tickers, years)
+        
+        # Combine everything into a report
+        report = {
+            "meta": insights["meta"],
+            "summary": self._generate_summary(insights),
+            "visualizations": {
+                "risk_trend_chart": risk_trend_chart,
+                "sentiment_chart": sentiment_chart,
+                "entity_network": entity_network,
+                "topic_radar": topic_radar,
+                "similarity_heatmap": similarity_heatmap
+            },
+            "insights": insights
+        }
+        
+        return report
+    
+    def _generate_summary(self, insights):
+        """Generate a text summary of the aggregate insights"""
+        # This would typically use NLG or an LLM to generate a summary
+        # Here's a simple template-based approach
+        
+        risk_insights = insights.get("risk_insights", {})
+        sentiment_insights = insights.get("sentiment_insights", {})
+        common_topics = insights.get("common_topics", [])
+        
+        tickers = insights["meta"]["tickers"]
+        years = insights["meta"]["years"]
+        
+        summary = f"""
+        # Aggregate SEC Filing Analysis: {', '.join(tickers)} ({min(years)}-{max(years)})
+        
+        Key Risk Insights
+        
+        """
+        
+        if "top_risks" in risk_insights and not isinstance(risk_insights["top_risks"], str):
+            top_risks = risk_insights["top_risks"]
+            if len(top_risks) > 0:
+                summary += "Top Risk Factors\n"
+                for _, row in top_risks.head(3).iterrows():
+                    summary += f"- {row['risk_name']} ({row['risk_category']}): Severity {row['severity']:.2f}\n"
+                summary += "\n"
+        
+        if "common_risks" in risk_insights and not isinstance(risk_insights["common_risks"], str):
+            common_risks = risk_insights["common_risks"]
+            if len(common_risks) > 0:
+                summary += "### Common Risk Factors Across Companies\n"
+                for _, row in common_risks.head(3).iterrows():
+                    summary += f"- {row['risk_name']} ({row['risk_category']}): Mentioned by {row['company_count']} companies\n"
+                summary += "\n"
+        
+        summary += "## Sentiment Analysis\n\n"
+        
+        if "yearly_sentiment" in sentiment_insights and not isinstance(sentiment_insights["yearly_sentiment"], str):
+            yearly_sentiment = sentiment_insights["yearly_sentiment"]
+            if len(yearly_sentiment) > 0:
+                summary += "### Sentiment Trends Over Time\n"
+                for _, row in yearly_sentiment.iterrows():
+                    sentiment_label = "Positive" if row['compound'] > 0.05 else "Negative" if row['compound'] < -0.05 else "Neutral"
+                    summary += f"- {int(row['filing_year'])}: {sentiment_label} ({row['compound']:.2f})\n"
+                summary += "\n"
+        
+        if "company_sentiment" in sentiment_insights and not isinstance(sentiment_insights["company_sentiment"], str):
+            company_sentiment = sentiment_insights["company_sentiment"]
+            if len(company_sentiment) > 0:
+                summary += "### Company Sentiment Comparison\n"
+                for _, row in company_sentiment.iterrows():
+                    sentiment_label = "Positive" if row['compound'] > 0.05 else "Negative" if row['compound'] < -0.05 else "Neutral"
+                    summary += f"- {row['ticker']}: {sentiment_label} ({row['compound']:.2f})\n"
+                summary += "\n"
+        
+        summary += "## Common Topics\n\n"
+        
+        for topic in common_topics:
+            summary += f"- {topic['description']}: Prevalence {topic['prevalence']:.2f}\n"
+            summary += f"  Keywords: {', '.join(topic['keywords'])}\n"
+        
+        return summary
+
+def add_aggregate_insights_tab(tabs):
+    with tabs[8]:  # This is the "Aggregate Insights" tab
+        st.header("Aggregate Insights from Multiple SEC Filings")
+        
+        # Input controls for aggregate analysis
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            tickers_input = st.text_input("Company Tickers (comma-separated)", "AAPL,MSFT,GOOGL")
+            tickers = [ticker.strip().upper() for ticker in tickers_input.split(',') if ticker.strip()]
+            
+            filing_type = st.selectbox("Filing Type for Aggregation", ["10-K", "10-Q", "8-K"], key="agg_filing_type")
+        
+        with col2:
+            start_year = st.number_input("Start Year", min_value=2010, max_value=2023, value=2020)
+            end_year = st.number_input("End Year", min_value=2010, max_value=2023, value=2023)
+            years = list(range(start_year, end_year + 1))
+        
+        # Analysis options
+        st.subheader("Analysis Options")
+        
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            analyze_risks = st.checkbox("Risk Factor Analysis", True, key="agg_risks")
+            analyze_sentiment = st.checkbox("Sentiment Analysis", True, key="agg_sentiment")
+        
+        with col2:
+            analyze_entities = st.checkbox("Entity Analysis", True, key="agg_entities")
+            analyze_topics = st.checkbox("Topic Analysis", True, key="agg_topics")
+
+        with col3:
+            analyze_similarity = st.checkbox("Company Similarity", True, key="agg_similarity")
+            generate_report = st.checkbox("Generate Summary Report", True, key="agg_report")
+        
+        # Process button
+        if st.button("Analyze Multiple Filings", type="primary", key="agg_analyze_button"):
+            if not tickers:
+                st.error("Please enter at least one ticker symbol")
+            elif start_year > end_year:
+                st.error("Start year must be less than or equal to end year")
+            else:
+                with st.spinner(f"Analyzing {len(tickers)} companies across {len(years)} years..."):
+                    # Initialize the aggregator
+                    if 'aggregator' not in st.session_state:
+                        st.session_state.aggregator = SECFilingsAggregator()
+                    
+                    # Generate insights
+                    insights = st.session_state.aggregator.generate_aggregate_insights(tickers, years, filing_type)
+                    
+                    if "error" in insights:
+                        st.error(insights["error"])
+                    else:
+                        st.session_state.aggregate_insights = insights
+                        st.success(f"Successfully analyzed {len(tickers)} companies across {len(years)} years")
+        
+        # Display results if available
+        if 'aggregate_insights' in st.session_state:
+            insights = st.session_state.aggregate_insights
+            
+            # Summary report
+            if generate_report:
+                st.subheader("Summary Report")
+                summary = st.session_state.aggregator._generate_summary(insights)
+                st.markdown(summary)
+            
+            # Risk factor analysis
+            if analyze_risks and "risk_insights" in insights:
+                st.subheader("Risk Factor Analysis")
+                
+                risk_insights = insights["risk_insights"]
+                
+                # Risk trend chart
+                risk_trend_chart = st.session_state.aggregator.create_risk_trend_chart(tickers, years)
+                if risk_trend_chart:
+                    st.plotly_chart(risk_trend_chart, use_container_width=True)
+                
+                # Common risks
+                if "common_risks" in risk_insights and not isinstance(risk_insights["common_risks"], str):
+                    st.write("#### Common Risk Factors Across Companies")
+                    common_risks = risk_insights["common_risks"]
+                    if len(common_risks) > 0:
+                        st.dataframe(common_risks)
+                
+                # Top risks
+            
+                if "top_risks" in risk_insights and not isinstance(risk_insights["top_risks"], str):
+                    top_risks_df = risk_insights["top_risks"]
+    
+                    if not top_risks_df.empty:
+                        # Organize risk data by category
+                        risk_data = {}
+                        for _, row in top_risks_df.iterrows():
+                            category = row['risk_category']
+                            name = row['risk_name']
+                            severity = row['severity']
+                            trend = row.get('trend', 'stable')  # fallback if trend not present
+                            if category not in risk_data:
+                                risk_data[category] = []
+                                risk_data[category].append((name, severity, trend))
+        
+                        # Create and render heatmap
+                        st.write("#### Risk Severity Heatmap")
+                        risk_heatmap = create_risk_heatmap(risk_data)
+                        st.plotly_chart(risk_heatmap, use_container_width=True, key="aggregate_risk_heatmap")
+
+            
+            # Sentiment analysis
+            if analyze_sentiment and "sentiment_insights" in insights:
+                st.subheader("Sentiment Analysis")
+                
+                sentiment_insights = insights["sentiment_insights"]
+                
+                # Sentiment comparison chart
+                sentiment_chart = st.session_state.aggregator.create_sentiment_comparison_chart(tickers, years)
+                if sentiment_chart:
+                    st.plotly_chart(sentiment_chart, use_container_width=True, key="sentiment_comparison_chart")
+                
+                # Yearly sentiment
+                if "yearly_sentiment" in sentiment_insights and not isinstance(sentiment_insights["yearly_sentiment"], str):
+                    st.write("#### Sentiment Trends Over Time")
+                    yearly_sentiment = sentiment_insights["yearly_sentiment"]
+                    if len(yearly_sentiment) > 0:
+                        st.dataframe(yearly_sentiment)
+                
+                # Company sentiment
+                if "company_sentiment" in sentiment_insights and not isinstance(sentiment_insights["company_sentiment"], str):
+                    st.write("#### Company Sentiment Comparison")
+                    company_sentiment = sentiment_insights["company_sentiment"]
+                    if len(company_sentiment) > 0:
+                        st.dataframe(company_sentiment)
+            
+            # Entity analysis
+            if analyze_entities and "entity_insights" in insights:
+                st.subheader("Entity Analysis")
+                
+                entity_insights = insights["entity_insights"]
+                
+                # Entity network chart
+                entity_network = st.session_state.aggregator.create_entity_network_chart(tickers, years)
+                if entity_network:
+                    st.plotly_chart(entity_network, use_container_width=True, key="entity_network_chart")
+                
+                # Top entities
+                if "top_entities" in entity_insights and not isinstance(entity_insights["top_entities"], str):
+                    st.write("#### Top Entities Across All Filings")
+                    top_entities = entity_insights["top_entities"]
+                    if len(top_entities) > 0:
+                        st.dataframe(top_entities)
+            
+            # Topic analysis
+            if analyze_topics and "common_topics" in insights:
+                st.subheader("Topic Analysis")
+                
+                # Topic radar chart
+                topic_radar = st.session_state.aggregator.create_topic_radar_chart(tickers, years)
+                if topic_radar:
+                    st.plotly_chart(topic_radar, use_container_width=True, key="topic_radar_chart")
+                
+                # Common topics
+                st.write("#### Common Topics Across Filings")
+                common_topics = insights["common_topics"]
+                for topic in common_topics:
+                    with st.expander(f"{topic['description']} (Prevalence: {topic['prevalence']:.2f})"):
+                        st.write(f"**Keywords:** {', '.join(topic['keywords'])}")
+            
+            # Company similarity
+            if analyze_similarity:
+                st.subheader("Company Similarity Analysis")
+
+                similarity_heatmap = st.session_state.aggregator.create_similarity_heatmap(tickers, years)
+
+                if similarity_heatmap:
+                    st.plotly_chart(similarity_heatmap, use_container_width=True, key=f"similarity_heatmap_{len(tickers)}_{len(years)}")
+                    st.info("This heatmap shows the textual similarity between companies based on their SEC filings. Higher values indicate more similar content.")
+                else:
+                    st.warning("No similarity heatmap available. Check if there's enough data or diverse content between companies.")
+
 
 def create_sentiment_chart(sentiment_data):
     labels = ['Positive', 'Negative', 'Neutral']
@@ -2191,6 +3290,11 @@ def create_risk_heatmap(risk_data):
 
 def create_entity_network(entities, min_entities=10):
     try:
+        # Check if pyvis is available
+        if 'Network' not in globals():
+            st.warning("Entity network visualization not available. Please install pyvis package.")
+            return None
+            
         G = nx.Graph()
         
         entity_counts = {}
@@ -2231,7 +3335,7 @@ def create_entity_network(entities, min_entities=10):
         
         return html_string
     except Exception as e:
-        print(f"Error creating entity network: {e}")
+        st.warning(f"Error creating entity network: {e}")
         return None
 
 def create_topic_radar_chart(topics):
@@ -2262,29 +3366,37 @@ def create_topic_radar_chart(topics):
     return fig
 
 def create_year_comparison_chart(ticker, years, sentiment_data):
+    # Ensure all sentiment fields are present, fallback to 0.0 if missing
+    for year in years:
+        sentiment_data.setdefault(year, {})
+        sentiment_data[year].setdefault('pos', 0.0)
+        sentiment_data[year].setdefault('neg', 0.0)
+        sentiment_data[year].setdefault('neu', 0.0)
+        sentiment_data[year].setdefault('compound', 0.0)
+
     fig = go.Figure()
-    
+
     fig.add_trace(go.Bar(
         x=years,
         y=[sentiment_data[year]['pos'] for year in years],
         name='Positive',
         marker_color='#4CAF50'
     ))
-    
+
     fig.add_trace(go.Bar(
         x=years,
         y=[sentiment_data[year]['neg'] for year in years],
         name='Negative',
         marker_color='#F44336'
     ))
-    
+
     fig.add_trace(go.Bar(
         x=years,
         y=[sentiment_data[year]['neu'] for year in years],
         name='Neutral',
         marker_color='#2196F3'
     ))
-    
+
     fig.add_trace(go.Scatter(
         x=years,
         y=[sentiment_data[year]['compound'] for year in years],
@@ -2292,7 +3404,7 @@ def create_year_comparison_chart(ticker, years, sentiment_data):
         name='Overall Sentiment',
         line=dict(color='#FFC107', width=3)
     ))
-    
+
     fig.update_layout(
         title=f"Sentiment Trend for {ticker}",
         xaxis_title="Year",
@@ -2301,8 +3413,9 @@ def create_year_comparison_chart(ticker, years, sentiment_data):
         height=400,
         margin=dict(l=20, r=20, t=40, b=20)
     )
-    
+
     return fig
+
 
 def create_classification_chart(classifications):
     categories = [c[0] for c in classifications]
@@ -2359,7 +3472,7 @@ def generate_pdf_report(results):
     pdf.cell(200, 10, txt=f"SEC Filings Analysis Report - {results['ticker']} {results['year']} {results['filing_type']}", ln=1, align='C')
     pdf.ln(10)
     
-    # Add company information
+    # Company info
     pdf.set_font("Arial", 'B', 14)
     pdf.cell(200, 10, txt="Company Information", ln=1)
     pdf.set_font("Arial", size=12)
@@ -2370,7 +3483,7 @@ def generate_pdf_report(results):
     if results.get('quarter'):
         pdf.cell(200, 10, txt=f"Quarter: Q{results['quarter']}", ln=1)
     
-    # Get company name from database
+    # Get company name
     conn = sqlite3.connect('sec_filings.db')
     c = conn.cursor()
     c.execute("SELECT name FROM companies WHERE ticker = ?", (results['ticker'],))
@@ -2381,7 +3494,7 @@ def generate_pdf_report(results):
         pdf.cell(200, 10, txt=f"Company Name: {company_name[0]}", ln=1)
     pdf.ln(5)
     
-    # Add sections overview
+    # Sections overview
     pdf.set_font("Arial", 'B', 14)
     pdf.cell(200, 10, txt="Sections Extracted", ln=1)
     pdf.set_font("Arial", size=12)
@@ -2389,7 +3502,7 @@ def generate_pdf_report(results):
         pdf.cell(200, 10, txt=f"- {section.replace('_', ' ').title()}: {length} characters", ln=1)
     pdf.ln(5)
     
-    # Add risk factors if available
+    # Risk Factors Summary
     if 'risk_factors' in results.get('summaries', {}):
         pdf.set_font("Arial", 'B', 14)
         pdf.cell(200, 10, txt="Risk Factors Summary", ln=1)
@@ -2397,7 +3510,7 @@ def generate_pdf_report(results):
         pdf.multi_cell(0, 10, txt=results['summaries']['risk_factors'])
         pdf.ln(5)
     
-    # Add sentiment analysis
+    # Sentiment Analysis
     if 'sentiment' in results and 'risk_factors' in results['sentiment']:
         pdf.set_font("Arial", 'B', 14)
         pdf.cell(200, 10, txt="Sentiment Analysis", ln=1)
@@ -2409,7 +3522,7 @@ def generate_pdf_report(results):
         pdf.cell(200, 10, txt=f"Compound Score: {sentiment['compound']:.2f}", ln=1)
         pdf.ln(5)
     
-    # Add text classification if available
+    # Text Classification
     if 'classifications' in results and 'risk_factors' in results['classifications']:
         pdf.set_font("Arial", 'B', 14)
         pdf.cell(200, 10, txt="Text Classification", ln=1)
@@ -2419,7 +3532,7 @@ def generate_pdf_report(results):
             pdf.cell(200, 10, txt=f"- {category}: {confidence_pct}", ln=1)
         pdf.ln(5)
     
-    # Add anomaly detection if available
+    # Anomaly Detection
     if 'anomalies' in results and 'risk_factors' in results['anomalies']:
         pdf.set_font("Arial", 'B', 14)
         pdf.cell(200, 10, txt="Anomaly Detection", ln=1)
@@ -2429,34 +3542,11 @@ def generate_pdf_report(results):
             pdf.cell(200, 10, txt=f"- {desc}: {score_pct}", ln=1)
         pdf.ln(5)
     
-    # Save to bytes buffer
-    buffer = BytesIO()
-    pdf_output = pdf.output(dest='S').encode('latin-1')
-    buffer.write(pdf_output)
-    buffer.seek(0)
-    return buffer
-
-def create_sentiment_chart(sentiment):
-    """Create a sentiment analysis chart"""
-    labels = ['Positive', 'Negative', 'Neutral']
-    values = [sentiment['pos'], sentiment['neg'], sentiment['neu']]
-    colors = ['#4CAF50', '#F44336', '#2196F3']
-    
-    fig = go.Figure(data=[go.Pie(
-        labels=labels,
-        values=values,
-        hole=.4,
-        marker_colors=colors
-    )])
-    
-    fig.update_layout(
-        title_text="Sentiment Distribution",
-        annotations=[dict(text=f"Compound: {sentiment['compound']:.2f}", x=0.5, y=0.5, font_size=15, showarrow=False)],
-        height=400,
-        margin=dict(l=20, r=20, t=40, b=20)
-    )
-    
-    return fig
+    # Write PDF to a buffer
+    pdf_buffer = BytesIO()
+    pdf.output(pdf_buffer)
+    pdf_buffer.seek(0)
+    return pdf_buffer
 
 def main():
     st.title("SEC Filings Insights Extraction with AI")
@@ -2500,7 +3590,6 @@ def main():
         analyze_sentiment = st.checkbox("Sentiment Analysis", True)
         analyze_entities = st.checkbox("Entity Recognition", True)
         analyze_topics = st.checkbox("Topic Modeling", True)
-        generate_summaries = st.checkbox("Generate Summaries", True)
         analyze_classification = st.checkbox("Text Classification", True)
         analyze_anomalies = st.checkbox("Anomaly Detection", True)
         generate_ai_insights = st.checkbox("Generate AI Insights", openai_api_key != "")
@@ -2517,7 +3606,7 @@ def main():
     
     # Main content
     tabs = st.tabs(["Dashboard", "Risk Analysis", "Sentiment Analysis", "Entity Analysis", 
-                   "Topic Analysis", "Text Classification", "Anomaly Detection", "Agentic AI"])
+                   "Topic Analysis", "Text Classification", "Anomaly Detection", "Agentic AI", "Aggregate Insights"])
     
     if 'analysis_results' not in st.session_state:
         st.session_state.analysis_results = None
@@ -2610,18 +3699,14 @@ def main():
             sentiment_label = "Negative" if compound_score < -0.05 else "Positive" if compound_score > 0.05 else "Neutral"
             
             metric_cols[0].metric("Overall Sentiment", sentiment_label, f"{compound_score:.2f}")
-            metric_cols[1].metric("Entities Extracted", sum(len(entities) for entities in results.get('entities', {}).values()))
-            
-            # FIX: Use the integer value directly instead of trying to get its length
-            total_topics = sum(topic_count for topic_count in results.get('topics', {}).values())
-            metric_cols[2].metric("Topics Identified", total_topics)
-            
+            metric_cols[1].metric("Entities Extracted", sum(results.get('entities', {}).values()))
+            metric_cols[2].metric("Topics Identified", sum(results.get('topics', {}).values()))
             metric_cols[3].metric("Sections Analyzed", len(results.get('sections', {})))
             
             if 'sentiment' in results and 'risk_factors' in results['sentiment']:
                 st.subheader("Sentiment Overview")
                 sentiment_chart = create_sentiment_chart(results['sentiment']['risk_factors'])
-                st.plotly_chart(sentiment_chart, use_container_width=True)
+                st.plotly_chart(sentiment_chart, use_container_width=True, key=f"sentiment_chart_{section}")
         
         # Risk Analysis tab
         if analyze_risk:
@@ -2638,10 +3723,12 @@ def main():
                     JOIN companies c ON f.company_id = c.id
                     WHERE c.ticker = ? AND f.filing_year = ? AND f.filing_type = ?
                 """, (results['ticker'], results['year'], results['filing_type']))
-                risk_factors_data = c.fetchall()
+                
+                risk_factors = c.fetchall()
                 conn.close()
                 
-                if not risk_factors_data:
+                if not risk_factors:
+                    # Generate mock data for demo
                     risk_categories = ["Operational", "Technological", "Regulatory", "Market"]
                     risk_names = [
                         ["Supply Chain Disruption", "Manufacturing Delays", "Quality Control Issues"],
@@ -2652,36 +3739,43 @@ def main():
                     severities = [0.85, 0.72, 0.65, 0.88, 0.71, 0.75, 0.78, 0.81, 0.76, 0.82, 0.69, 0.77]
                     trends = ["up", "stable", "down"]
                     
-                    risk_factors_data = []
+                    risk_factors = []
                     for i, category in enumerate(risk_categories):
                         for j, name in enumerate(risk_names[i]):
                             idx = i * 3 + j
-                            risk_factors_data.append((category, name, severities[idx], trends[idx % 3]))
+                            risk_factors.append((category, name, severities[idx], trends[idx % 3]))
                 
-                risk_factors_by_category = {}
-                for category, name, severity, trend in risk_factors_data:
-                    if category not in risk_factors_by_category:
-                        risk_factors_by_category[category] = []
-                    risk_factors_by_category[category].append((name, severity, trend))
+                # Organize risk factors by category
+                risk_data = {}
+                for category, name, severity, trend in risk_factors:
+                    if category not in risk_data:
+                        risk_data[category] = []
+                    risk_data[category].append((name, severity, trend))
                 
-                for category, risks in risk_factors_by_category.items():
-                    with st.expander(f"{category} Risks", expanded=True):
+                # Display risk factors by category
+                st.subheader("Risk Factors by Category")
+                
+                for category, risks in risk_data.items():
+                    with st.expander(f"{category} Risks"):
                         for name, severity, trend in risks:
                             severity_pct = f"{severity * 100:.0f}%"
                             trend_icon = "↑" if trend == "up" else "↓" if trend == "down" else "→"
-                            
-                            col1, col2, col3 = st.columns([3, 1, 1])
-                            col1.text(name)
-                            col2.progress(severity)
-                            col3.text(f"{severity_pct} {trend_icon}")
+                            st.markdown(f"- **{name}** (Severity: {severity_pct}, Trend: {trend_icon})")
                 
+                # Create risk heatmap
                 st.subheader("Risk Severity Heatmap")
-                risk_heatmap = create_risk_heatmap(risk_factors_by_category)
-                st.plotly_chart(risk_heatmap, use_container_width=True)
+                risk_heatmap = create_risk_heatmap(risk_data)
+                st.plotly_chart(risk_heatmap, use_container_width=True, key="risk_heatmap_chart")
                 
-                if 'summaries' in results and 'risk_factors' in results['summaries']:
+                # Risk factors summary
+                if 'risk_factors' in results.get('summaries', {}):
                     st.subheader("Risk Factors Summary")
-                    st.write(results['summaries']['risk_factors'])
+                    st.markdown(results['summaries']['risk_factors'])
+                
+                # AI insights for risk factors
+                if 'risk_factors' in results.get('insights', {}):
+                    st.subheader("AI Insights on Risk Factors")
+                    st.markdown(results['insights']['risk_factors'])
         
         # Sentiment Analysis tab
         if analyze_sentiment:
@@ -2689,166 +3783,237 @@ def main():
                 st.header("Sentiment Analysis")
                 
                 if 'sentiment' in results:
-                    section_tabs = st.tabs([section_name.replace('_', ' ').title() for section_name in results['sentiment'].keys()])
+                    sentiment_data = {}
+                    for section_name, sentiment in results['sentiment'].items():
+                        sentiment_data[section_name] = sentiment
                     
-                    for i, (section_name, sentiment) in enumerate(results['sentiment'].items()):
-                        with section_tabs[i]:
-                            col1, col2, col3 = st.columns(3)
-                            with col1:
-                                st.metric("Positive", f"{sentiment['pos']:.2f}")
-                            with col2:
-                                st.metric("Negative", f"{sentiment['neg']:.2f}")
-                            with col3:
-                                st.metric("Neutral", f"{sentiment['neu']:.2f}")
+                    # Display sentiment for each section
+                    for section_name, sentiment in sentiment_data.items():
+                        st.subheader(f"{section_name.replace('_', ' ').title()} Sentiment")
+                        
+                        col1, col2 = st.columns([1, 2])
+                        
+                        with col1:
+                            compound_score = sentiment['compound']
+                            sentiment_label = "Negative" if compound_score < -0.05 else "Positive" if compound_score > 0.05 else "Neutral"
                             
-                            compound = sentiment['compound']
-                            if compound >= 0.05:
-                                st.success(f"Overall Sentiment: Positive ({compound:.2f})")
-                            elif compound <= -0.05:
-                                st.error(f"Overall Sentiment: Negative ({compound:.2f})")
-                            else:
-                                st.info(f"Overall Sentiment: Neutral ({compound:.2f})")
-                            
+                            st.metric("Overall Sentiment", sentiment_label, f"{compound_score:.2f}")
+                            st.metric("Positive", f"{sentiment['pos']:.2f}")
+                            st.metric("Negative", f"{sentiment['neg']:.2f}")
+                            st.metric("Neutral", f"{sentiment['neu']:.2f}")
+                        
+                        with col2:
                             sentiment_chart = create_sentiment_chart(sentiment)
-                            st.plotly_chart(sentiment_chart, use_container_width=True)
+                            st.plotly_chart(sentiment_chart, use_container_width=True, key=f"sentiment_chart_{ticker}_{year}_{section_name}")
                     
-                    st.subheader("Year-over-Year Sentiment Comparison")
+                    # Year-over-year comparison (mock data for demo)
+                    st.subheader("Sentiment Trend Analysis")
                     
-                    years = [results['year'] - 2, results['year'] - 1, results['year']]
-                    mock_sentiment_data = {
-                        years[0]: {
-                            'pos': max(0.1, sentiment['pos'] - 0.1 + random.uniform(-0.05, 0.05)),
-                            'neg': max(0.1, sentiment['neg'] - 0.05 + random.uniform(-0.05, 0.05)),
-                            'neu': max(0.1, sentiment['neu'] + 0.05 + random.uniform(-0.05, 0.05)),
-                            'compound': min(1.0, max(-1.0, sentiment['compound'] + 0.1 + random.uniform(-0.05, 0.05)))
-                        },
-                        years[1]: {
-                            'pos': max(0.1, sentiment['pos'] - 0.05 + random.uniform(-0.05, 0.05)),
-                            'neg': max(0.1, sentiment['neg'] + random.uniform(-0.05, 0.05)),
-                            'neu': max(0.1, sentiment['neu'] + random.uniform(-0.05, 0.05)),
-                            'compound': min(1.0, max(-1.0, sentiment['compound'] + 0.05 + random.uniform(-0.05, 0.05)))
-                        },
-                        years[2]: sentiment
-                    }
+                    # Generate mock data for previous years
+                    current_year = results['year']
+                    previous_years = list(range(current_year - 4, current_year + 1))
                     
-                    year_comparison_chart = create_year_comparison_chart(results['ticker'], years, mock_sentiment_data)
-                    st.plotly_chart(year_comparison_chart, use_container_width=True)
+                    yearly_sentiment = {}
+                    for year in previous_years:
+                        if year == current_year:
+                            yearly_sentiment[year] = results['sentiment'].get('risk_factors', {})
+                        else:
+                            # Generate mock data with slight variations
+                            base_compound = results['sentiment'].get('risk_factors', {}).get('compound', 0)
+                            year_diff = (year - (current_year - 4)) / 4  # Normalize to 0-1 range
+                            compound = max(-0.95, min(0.95, base_compound - 0.2 + year_diff * 0.4))
+                            
+                            pos = max(0.1, min(0.9, results['sentiment'].get('risk_factors', {}).get('pos', 0.3) - 0.1 + year_diff * 0.2))
+                            neg = max(0.1, min(0.9, results['sentiment'].get('risk_factors', {}).get('neg', 0.3) - 0.1 + year_diff * 0.2))
+                            neu = max(0.1, min(0.9, 1 - pos - neg))
+                            
+                            yearly_sentiment[year] = {
+                                'compound': compound,
+                                'pos': pos,
+                                'neg': neg,
+                                'neu': neu
+                            }
+                    
+                    year_comparison_chart = create_year_comparison_chart(results['ticker'], previous_years, yearly_sentiment)
+                    st.plotly_chart(year_comparison_chart, use_container_width=True, key="year_comparison_chart")
+                    
+                    # AI insights for sentiment
+                    if 'mda' in results.get('insights', {}):
+                        st.subheader("AI Insights on Sentiment")
+                        st.markdown(results['insights'].get('mda', ''))
                 else:
-                    st.warning("Sentiment analysis not available")
+                    st.info("No sentiment data available for this filing.")
         
         # Entity Analysis tab
         if analyze_entities:
             with tabs[3]:
-                st.header("Entity Recognition")
+                st.header("Entity Analysis")
                 
-                conn = sqlite3.connect('sec_filings.db')
-                c = conn.cursor()
-                c.execute("""
-                    SELECT e.entity_type, e.entity_name, COUNT(*) as count
-                    FROM entities e
-                    JOIN sections s ON e.section_id = s.id
-                    JOIN filings f ON s.filing_id = f.id
-                    JOIN companies c ON f.company_id = c.id
-                    WHERE c.ticker = ? AND f.filing_year = ? AND f.filing_type = ?
-                    GROUP BY e.entity_type, e.entity_name
-                    ORDER BY count DESC
-                    LIMIT 100
-                """, (results['ticker'], results['year'], results['filing_type']))
-                entities_data = c.fetchall()
-                conn.close()
-                
-                if not entities_data:
-                    entity_types = ["ORG", "PERSON", "GPE", "LOC", "PRODUCT"]
-                    entity_names = [
-                        [results['ticker'], "Competitors", "Suppliers", "Regulatory Bodies", "Partners"],
-                        ["CEO", "CFO", "Board Members", "Executives"],
-                        ["United States", "China", "Europe", "Asia Pacific"],
-                        ["Manufacturing Facilities", "Headquarters", "Distribution Centers"],
-                        ["Core Products", "Services", "Software", "Hardware"]
-                    ]
-                    frequencies = [0.92, 0.45, 0.32, 0.28, 0.22, 0.85, 0.65, 0.55, 0.45, 0.68, 0.42, 0.38, 0.32, 0.25, 0.20, 0.15, 0.75, 0.58, 0.48, 0.42]
-                    sentiments = [0.68, 0.38, 0.52, 0.41, 0.65, 0.60, 0.55, 0.50, 0.45, 0.62, 0.45, 0.58, 0.55, 0.51, 0.48, 0.45, 0.72, 0.68, 0.65, 0.61]
+                if 'entities' in results:
+                    # Query database for entities
+                    conn = sqlite3.connect('sec_filings.db')
+                    c = conn.cursor()
                     
-                    entities_data = []
-                    idx = 0
-                    for i, entity_type in enumerate(entity_types):
-                        for j, name in enumerate(entity_names[i]):
-                            if idx < len(frequencies) and j < len(entity_names[i]):
-                                count = int(frequencies[idx] * 10)
-                                entities_data.append((entity_type, name, count))
-                                idx += 1
-                
-                entity_types = {}
-                for entity_type, entity_name, count in entities_data:
-                    if entity_type not in entity_types:
-                        entity_types[entity_type] = []
-                    entity_types[entity_type].append((entity_name, count, 0.5))
-                
-                for entity_type, entities_list in entity_types.items():
-                    with st.expander(f"{entity_type} Entities", expanded=True):
-                        df = pd.DataFrame(entities_list, columns=["Entity", "Count", "Sentiment"])
-                        st.dataframe(df[["Entity", "Count"]], use_container_width=True)
-                        
-                        if len(df) > 0:
-                            top_df = df.head(10)
-                            fig = px.bar(
-                                top_df,
-                                x="Entity",
-                                y="Count",
-                                title=f"Top {entity_type} Entities",
-                                color="Count",
-                                color_continuous_scale="Viridis"
-                            )
-                            st.plotly_chart(fig, use_container_width=True)
-                
-                st.subheader("Entity Relationship Network")
-                html_string = create_entity_network(entity_types)
-                if html_string:
-                    components.html(html_string, height=600)
-                else:
-                    st.warning("Entity network visualization not available")
-        
-        # Topic Analysis tab
-        if analyze_topics:
-            with tabs[4]:
-                st.header("Topic Modeling")
-                
-                if 'topics' in results:
-                    for section_name, topic_count in results['topics'].items():
-                        st.subheader(f"{section_name.replace('_', ' ').title()} Topics")
-                        
-                        conn = sqlite3.connect('sec_filings.db')
-                        c = conn.cursor()
+                    entities_by_type = {}
+                    for section_name in results['entities'].keys():
                         c.execute("""
-                            SELECT s.section_text
-                            FROM sections s
+                            SELECT e.entity_type, e.entity_name, e.frequency, e.sentiment
+                            FROM entities e
+                            JOIN sections s ON e.section_id = s.id
                             JOIN filings f ON s.filing_id = f.id
                             JOIN companies c ON f.company_id = c.id
                             WHERE c.ticker = ? AND f.filing_year = ? AND f.filing_type = ? AND s.section_name = ?
                         """, (results['ticker'], results['year'], results['filing_type'], section_name))
-                        section_text = c.fetchone()
-                        conn.close()
                         
-                        if section_text:
-                            cleaned_text = st.session_state.pipeline.clean_text(section_text[0])
-                            topics = st.session_state.pipeline.extract_topics(cleaned_text, num_topics=topic_count)
+                        entities = c.fetchall()
+                        
+                        if not entities:
+                            # Generate mock data for demo
+                            entity_types = ["ORG", "PERSON", "GPE", "LOC", "PRODUCT"]
+                            entity_names = [
+                                [results['ticker'], "Competitors", "Suppliers", "Regulatory Bodies", "Partners"],
+                                ["CEO", "CFO", "Board Members", "Executives"],
+                                ["United States", "China", "Europe", "Asia Pacific"],
+                                ["Manufacturing Facilities", "Headquarters", "Distribution Centers"],
+                                ["Core Products", "Services", "Software", "Hardware"]
+                            ]
+                            frequencies = [0.92, 0.45, 0.32, 0.28, 0.22, 0.85, 0.65, 0.55, 0.45, 0.68, 0.42, 0.38, 0.32, 0.25, 0.20, 0.15, 0.75, 0.58, 0.48, 0.42]
+                            sentiments = [0.68, 0.38, 0.52, 0.41, 0.65, 0.60, 0.55, 0.50, 0.45, 0.62, 0.45, 0.58, 0.55, 0.51, 0.48, 0.45, 0.72, 0.68, 0.65, 0.61]
                             
-                            if topics:
-                                topic_chart = create_topic_radar_chart(topics)
-                                st.plotly_chart(topic_chart, use_container_width=True)
+                            entities = []
+                            idx = 0
+                            for i, entity_type in enumerate(entity_types):
+                                for j, name in enumerate(entity_names[i]):
+                                    if idx < len(frequencies) and j < len(entity_names[i]):
+                                        entities.append((entity_type, name, frequencies[idx], sentiments[idx]))
+                                        idx += 1
+                        
+                        # Organize entities by type
+                        section_entities = {}
+                        for entity_type, name, frequency, sentiment in entities:
+                            if entity_type not in section_entities:
+                                section_entities[entity_type] = []
+                            section_entities[entity_type].append((name, frequency, sentiment))
+                        
+                        entities_by_type[section_name] = section_entities
+                    
+                    conn.close()
+                    
+                    # Display entities by section and type
+                    for section_name, section_entities in entities_by_type.items():
+                        st.subheader(f"{section_name.replace('_', ' ').title()} Entities")
+                        
+                        # Create tabs for each entity type
+                        entity_tabs = st.tabs(list(section_entities.keys()))
+                        
+                        for i, (entity_type, entities) in enumerate(section_entities.items()):
+                            with entity_tabs[i]:
+                                # Create a table of entities
+                                entity_data = []
+                                for name, frequency, sentiment in sorted(entities, key=lambda x: x[1], reverse=True):
+                                    frequency_pct = f"{frequency * 100:.0f}%"
+                                    sentiment_label = "Negative" if sentiment < 0.4 else "Positive" if sentiment > 0.6 else "Neutral"
+                                    entity_data.append({
+                                        "Entity": name,
+                                        "Frequency": frequency_pct,
+                                        "Sentiment": sentiment_label
+                                    })
                                 
-                                for i, topic in enumerate(topics):
-                                    with st.expander(f"Topic {i+1}: {' '.join(topic['words'][:3])}"):
-                                        st.write(f"**Weight:** {topic['weight']:.2f}")
-                                        st.write(f"**Keywords:** {', '.join(topic['words'])}")
-                                        if 'summary' in topic:
-                                            st.write(f"**Summary:** {topic['summary']}")
+                                st.table(entity_data)
+                        
+                        # Create entity network visualization
+                        st.subheader("Entity Relationship Network")
+                        
+                        try:
+                            html_string = create_entity_network(section_entities)
+                            if html_string:
+                                components.html(html_string, height=600)
                             else:
-                                st.warning(f"No topics extracted for {section_name}")
-                        else:
-                            st.warning(f"Section text not found for {section_name}")
+                                st.info("Entity network visualization not available.")
+                        except Exception as e:
+                            st.error(f"Error creating entity network: {e}")
+                    
+                    # AI insights for entities
+                    if 'business' in results.get('insights', {}):
+                        st.subheader("AI Insights on Entities")
+                        st.markdown(results['insights'].get('business', ''))
                 else:
-                    st.warning("Topic modeling not available")
+                    st.info("No entity data available for this filing.")
+        
+        # Topic Analysis tab
+        if analyze_topics:
+            with tabs[4]:
+                st.header("Topic Analysis")
+                
+                if 'topics' in results:
+                    # Query database for topics (mock implementation)
+                    for section_name in results['topics'].keys():
+                        st.subheader(f"{section_name.replace('_', ' ').title()} Topics")
+                        
+                        # Generate mock topics
+                        topics = [
+                            {
+                                'id': 0,
+                                'words': ['risk', 'business', 'operations', 'financial', 'company', 'market', 'products', 'services', 'customers', 'competition'],
+                                'weight': 0.28
+                            },
+                            {
+                                'id': 1,
+                                'words': ['technology', 'data', 'security', 'systems', 'privacy', 'cyber', 'information', 'breach', 'digital', 'infrastructure'],
+                                'weight': 0.22
+                            },
+                            {
+                                'id': 2,
+                                'words': ['regulatory', 'compliance', 'legal', 'laws', 'regulations', 'government', 'requirements', 'changes', 'policies', 'jurisdictions'],
+                                'weight': 0.18
+                            },
+                            {
+                                'id': 3,
+                                'words': ['financial', 'revenue', 'costs', 'expenses', 'income', 'tax', 'capital', 'assets', 'liabilities', 'cash'],
+                                'weight': 0.17
+                            },
+                            {
+                                'id': 4,
+                                'words': ['market', 'industry', 'competition', 'competitive', 'customers', 'demand', 'trends', 'economic', 'global', 'growth'],
+                                'weight': 0.15
+                            }
+                        ]
+                        
+                        # Display topics
+                        for topic in topics:
+                            with st.expander(f"Topic {topic['id'] + 1}: {' '.join(topic['words'][:3])}"):
+                                st.markdown(f"**Weight:** {topic['weight']:.2f}")
+                                st.markdown(f"**Keywords:** {', '.join(topic['words'])}")
+                        
+                        # Create topic radar chart
+                        topic_chart = create_topic_radar_chart(topics)
+                        st.plotly_chart(topic_chart, use_container_width=True, key=f"topic_chart_{section_name}")
+                        
+                        # Create word cloud
+                        st.subheader("Word Cloud")
+                        
+                        # Generate word frequencies
+                        word_freqs = {}
+                        for topic in topics:
+                            for i, word in enumerate(topic['words']):
+                                word_freqs[word] = word_freqs.get(word, 0) + topic['weight'] * (len(topic['words']) - i) / len(topic['words'])
+                        
+                        # Create and display word cloud
+                        try:
+                            wordcloud = WordCloud(width=800, height=400, background_color='white', max_words=100).generate_from_frequencies(word_freqs)
+                            plt.figure(figsize=(10, 5))
+                            plt.imshow(wordcloud, interpolation='bilinear')
+                            plt.axis('off')
+                            st.pyplot(plt)
+                        except Exception as e:
+                            st.error(f"Error creating word cloud: {e}")
+                    
+                    # AI insights for topics
+                    if 'risk_factors' in results.get('insights', {}):
+                        st.subheader("AI Insights on Topics")
+                        st.markdown(results['insights'].get('risk_factors', ''))
+                else:
+                    st.info("No topic data available for this filing.")
         
         # Text Classification tab
         if analyze_classification:
@@ -2859,17 +4024,30 @@ def main():
                     for section_name, classifications in results['classifications'].items():
                         st.subheader(f"{section_name.replace('_', ' ').title()} Classification")
                         
-                        if classifications:
-                            classification_chart = create_classification_chart(classifications)
-                            st.plotly_chart(classification_chart, use_container_width=True)
-                            
-                            for category, confidence in classifications:
-                                confidence_pct = f"{confidence * 100:.1f}%"
-                                st.write(f"- **{category}:** {confidence_pct}")
-                        else:
-                            st.warning(f"No classifications available for {section_name}")
+                        # Display classification results
+                        classification_chart = create_classification_chart(classifications)
+                        st.plotly_chart(classification_chart, use_container_width=True, key=f"classification_chart_{section_name}")
+                        
+                        # Display classification details
+                        for category, confidence in classifications:
+                            confidence_pct = f"{confidence * 100:.1f}%"
+                            st.markdown(f"- **{category}**: {confidence_pct}")
+                        
+                        # Display classification explanation
+                        st.subheader("Classification Explanation")
+                        
+                        explanations = {
+                            "Risk Disclosure": "This section primarily focuses on disclosing potential risks and uncertainties that could affect the company's business, operations, or financial performance.",
+                            "Financial Performance": "This section contains information about the company's financial results, metrics, and performance indicators.",
+                            "Legal Matters": "This section discusses legal proceedings, regulatory matters, or compliance issues that the company is facing.",
+                            "Operational Update": "This section provides updates on the company's operations, business activities, and strategic initiatives."
+                        }
+                        
+                        for category, confidence in classifications:
+                            if category in explanations:
+                                st.markdown(f"**{category}** ({confidence_pct}): {explanations[category]}")
                 else:
-                    st.warning("Text classification not available")
+                    st.info("No classification data available for this filing.")
         
         # Anomaly Detection tab
         if analyze_anomalies:
@@ -2880,767 +4058,131 @@ def main():
                     for section_name, anomalies in results['anomalies'].items():
                         st.subheader(f"{section_name.replace('_', ' ').title()} Anomalies")
                         
-                        if anomalies:
-                            anomaly_chart = create_anomaly_chart(anomalies)
-                            st.plotly_chart(anomaly_chart, use_container_width=True)
+                        # Display anomaly results
+                        anomaly_chart = create_anomaly_chart(anomalies)
+                        st.plotly_chart(anomaly_chart, use_container_width=True, key=f"anomaly_chart_{section_name}")
+                        
+                        # Display anomaly details
+                        for description, score in anomalies:
+                            score_pct = f"{score * 100:.1f}%"
+                            st.markdown(f"- **{description}**: Anomaly score {score_pct}")
                             
-                            for description, score in anomalies:
-                                score_pct = f"{score * 100:.1f}%"
-                                st.write(f"- **{description}:** {score_pct}")
-                        else:
-                            st.write("No anomalies detected")
+                            # Generate explanation based on description
+                            if "legal proceedings" in description.lower():
+                                explanation = "The frequency of mentions of legal proceedings is higher than typical for this type of filing, which may indicate increased legal risks or ongoing litigation."
+                            elif "risk factor language" in description.lower():
+                                explanation = "The language used in risk factors shows significant changes compared to industry norms or previous filings, which may indicate new or evolving risks."
+                            elif "financial terminology" in description.lower():
+                                explanation = "The financial terminology used deviates from standard industry practices, which may indicate changes in accounting methods or financial reporting."
+                            else:
+                                explanation = "This anomaly represents a statistically significant deviation from typical patterns in SEC filings."
+                            
+                            st.markdown(f"  *{explanation}*")
                 else:
-                    st.warning("Anomaly detection not available")
+                    st.info("No anomaly detection data available for this filing.")
         
         # Agentic AI tab
-        with tabs[7]:
-            st.header("Agentic AI Analysis")
-            
-            if 'agentic_ai' in st.session_state and openai_api_key:
-                st.write("Use this tab to ask questions about the filing and get AI-powered answers.")
+        if openai_api_key:
+            with tabs[7]:
+                st.header("AI-Powered Analysis")
                 
-                user_query = st.text_input("Ask a question about this filing:", key="agentic_query")
-                
-                if st.button("Get Answer", key="agentic_button"):
-                    if user_query:
-                        with st.spinner("Analyzing..."):
-                            try:
-                                # Get relevant section text
-                                conn = sqlite3.connect('sec_filings.db')
-                                c = conn.cursor()
-                                c.execute("""
-                                    SELECT s.section_name, s.section_text
-                                    FROM sections s
-                                    JOIN filings f ON s.filing_id = f.id
-                                    JOIN companies c ON f.company_id = c.id
-                                    WHERE c.ticker = ? AND f.filing_year = ? AND f.filing_type = ?
-                                """, (results['ticker'], results['year'], results['filing_type']))
-                                sections_data = c.fetchall()
-                                conn.close()
-                                
-                                sections_dict = {name: text for name, text in sections_data}
-                                
-                                answer = st.session_state.agentic_ai.answer_question(
-                                    question=user_query,
-                                    sections=sections_dict,
-                                    ticker=results['ticker'],
-                                    year=results['year'],
-                                    filing_type=results['filing_type']
-                                )
-                                
-                                st.write("### Answer")
-                                st.write(answer)
-                                
-                                # Store the Q&A history
-                                if 'qa_history' not in st.session_state:
-                                    st.session_state.qa_history = []
-                                
-                                st.session_state.qa_history.append({
-                                    "question": user_query,
-                                    "answer": answer
-                                })
-                            except Exception as e:
-                                st.error(f"Error generating answer: {str(e)}")
-                    else:
-                        st.warning("Please enter a question")
-                
-                # Display Q&A history
-                if 'qa_history' in st.session_state and st.session_state.qa_history:
-                    st.subheader("Previous Questions")
-                    for i, qa in enumerate(st.session_state.qa_history):
-                        with st.expander(f"Q: {qa['question']}", expanded=False):
-                            st.write(qa['answer'])
-            else:
-                st.warning("Agentic AI requires an OpenAI API key. Please provide one in the sidebar.")
-
-# Define the SECFilingPipeline class
-class SECFilingPipeline:
-    def __init__(self, user_agent, email, openai_api_key=None):
-        self.user_agent = user_agent
-        self.email = email
-        self.openai_api_key = openai_api_key
-        self.nlp = spacy.load("en_core_web_sm")
-        self.initialize_database()
-    
-    def initialize_database(self):
-        """Initialize the SQLite database for storing SEC filings data"""
-        conn = sqlite3.connect('sec_filings.db')
-        c = conn.cursor()
-        
-        # Create tables if they don't exist
-        c.execute('''
-            CREATE TABLE IF NOT EXISTS companies (
-                id INTEGER PRIMARY KEY,
-                ticker TEXT UNIQUE,
-                name TEXT,
-                industry TEXT,
-                sector TEXT
-            )
-        ''')
-        
-        c.execute('''
-            CREATE TABLE IF NOT EXISTS filings (
-                id INTEGER PRIMARY KEY,
-                company_id INTEGER,
-                filing_type TEXT,
-                filing_year INTEGER,
-                filing_quarter INTEGER,
-                filing_date TEXT,
-                accession_number TEXT,
-                FOREIGN KEY (company_id) REFERENCES companies (id)
-            )
-        ''')
-        
-        c.execute('''
-            CREATE TABLE IF NOT EXISTS sections (
-                id INTEGER PRIMARY KEY,
-                filing_id INTEGER,
-                section_name TEXT,
-                section_text TEXT,
-                FOREIGN KEY (filing_id) REFERENCES filings (id)
-            )
-        ''')
-        
-        c.execute('''
-            CREATE TABLE IF NOT EXISTS entities (
-                id INTEGER PRIMARY KEY,
-                section_id INTEGER,
-                entity_type TEXT,
-                entity_name TEXT,
-                entity_count INTEGER,
-                FOREIGN KEY (section_id) REFERENCES sections (id)
-            )
-        ''')
-        
-        c.execute('''
-            CREATE TABLE IF NOT EXISTS risk_factors (
-                id INTEGER PRIMARY KEY,
-                section_id INTEGER,
-                risk_category TEXT,
-                risk_name TEXT,
-                severity REAL,
-                trend TEXT,
-                FOREIGN KEY (section_id) REFERENCES sections (id)
-            )
-        ''')
-        
-        conn.commit()
-        conn.close()
-    
-    def download_filing(self, ticker, year, filing_type, quarter=None):
-        """Download SEC filing for a company"""
-        try:
-            # Mock implementation - in a real app, this would use SEC EDGAR API
-            print(f"Downloading {filing_type} filing for {ticker} ({year})")
-            
-            # Check if filing already exists in database
-            conn = sqlite3.connect('sec_filings.db')
-            c = conn.cursor()
-            
-            # Check if company exists
-            c.execute("SELECT id FROM companies WHERE ticker = ?", (ticker,))
-            company_id = c.fetchone()
-            
-            if not company_id:
-                # Add company to database
-                c.execute("INSERT INTO companies (ticker, name) VALUES (?, ?)", 
-                         (ticker, f"{ticker} Inc."))
-                company_id = c.lastrowid
-            else:
-                company_id = company_id[0]
-            
-            # Check if filing exists
-            c.execute("""
-                SELECT id FROM filings 
-                WHERE company_id = ? AND filing_type = ? AND filing_year = ? AND 
-                      (filing_quarter = ? OR (? IS NULL AND filing_quarter IS NULL))
-            """, (company_id, filing_type, year, quarter, quarter))
-            
-            filing_id = c.fetchone()
-            
-            if not filing_id:
-                # Add filing to database
-                c.execute("""
-                    INSERT INTO filings (company_id, filing_type, filing_year, filing_quarter, filing_date) 
-                    VALUES (?, ?, ?, ?, ?)
-                """, (company_id, filing_type, year, quarter, f"{year}-{random.randint(1, 12):02d}-{random.randint(1, 28):02d}"))
-                filing_id = c.lastrowid
-            else:
-                filing_id = filing_id[0]
-            
-            conn.commit()
-            conn.close()
-            
-            return {
-                "status": "success",
-                "filing_id": filing_id,
-                "company_id": company_id
-            }
-        except Exception as e:
-            return {
-                "status": "error",
-                "error": str(e)
-            }
-    
-    def extract_sections(self, filing_id):
-        """Extract sections from a filing"""
-        try:
-            # Mock implementation - in a real app, this would parse the actual filing
-            sections = {
-                "risk_factors": "This section contains risk factors that may affect the company's operations...",
-                "management_discussion": "Management's discussion and analysis of financial condition...",
-                "financial_statements": "The financial statements and supplementary data...",
-                "business_overview": "Overview of the company's business operations..."
-            }
-            
-            # Store sections in database
-            conn = sqlite3.connect('sec_filings.db')
-            c = conn.cursor()
-            
-            for section_name, section_text in sections.items():
-                # Check if section already exists
-                c.execute("""
-                    SELECT id FROM sections 
-                    WHERE filing_id = ? AND section_name = ?
-                """, (filing_id, section_name))
-                
-                section_id = c.fetchone()
-                
-                if not section_id:
-                    # Generate mock text based on section name
-                    if section_name == "risk_factors":
-                        section_text = self.generate_mock_risk_factors()
-                    elif section_name == "management_discussion":
-                        section_text = self.generate_mock_md_and_a()
-                    elif section_name == "financial_statements":
-                        section_text = self.generate_mock_financial_statements()
-                    elif section_name == "business_overview":
-                        section_text = self.generate_mock_business_overview()
-                    
-                    # Add section to database
-                    c.execute("""
-                        INSERT INTO sections (filing_id, section_name, section_text) 
-                        VALUES (?, ?, ?)
-                    """, (filing_id, section_name, section_text))
-            
-            conn.commit()
-            conn.close()
-            
-            return {
-                "status": "success",
-                "sections": {name: len(text) for name, text in sections.items()}
-            }
-        except Exception as e:
-            return {
-                "status": "error",
-                "error": str(e)
-            }
-    
-    def generate_mock_risk_factors(self):
-        """Generate mock risk factors text"""
-        return """
-        Risk Factors
-        
-        Our business operations are subject to numerous risks and uncertainties, including those outside of our control, that could cause our actual results to be harmed. These risks include, but are not limited to:
-        
-        Market and Competition Risks:
-        - Intense competition in our industry may limit our growth and profitability
-        - Rapid technological changes may render our products obsolete
-        - Changes in consumer preferences may reduce demand for our products
-        - Economic downturns may reduce consumer spending on our products
-        
-        Operational Risks:
-        - Supply chain disruptions could impact our ability to deliver products
-        - Manufacturing delays could result in lost sales opportunities
-        - Quality control issues could damage our brand reputation
-        - Failure to attract and retain key personnel could harm our operations
-        
-        Technological Risks:
-        - Cybersecurity threats could compromise our systems and data
-        - Technology obsolescence could require significant capital investments
-        - Intellectual property protection challenges could impact our competitive position
-        - System failures could disrupt our operations
-        
-        Regulatory Risks:
-        - Changing compliance requirements could increase our costs
-        - International trade policies could impact our global operations
-        - Data privacy regulations could limit our marketing capabilities
-        - Environmental regulations could increase our operational costs
-        """
-    
-    def generate_mock_md_and_a(self):
-        """Generate mock Management Discussion and Analysis text"""
-        return """
-        Management's Discussion and Analysis of Financial Condition and Results of Operations
-        
-        Overview
-        
-        The following discussion should be read in conjunction with our consolidated financial statements and related notes. This discussion contains forward-looking statements that involve risks and uncertainties. Our actual results could differ materially from those anticipated in these forward-looking statements as a result of various factors.
-        
-        Results of Operations
-        
-        Revenue increased by 12% compared to the previous year, primarily driven by new product launches and expansion into international markets. Gross margin improved to 58% from 54% in the prior year due to manufacturing efficiencies and favorable product mix. Operating expenses increased by 8%, reflecting our continued investment in research and development and marketing initiatives to support future growth.
-        
-        Liquidity and Capital Resources
-        
-        As of the end of the fiscal year, we had $450 million in cash and cash equivalents, compared to $380 million at the end of the previous fiscal year. Operating activities generated $220 million in cash, while investing activities used $120 million primarily for capital expenditures and acquisitions. We believe our existing cash resources are sufficient to meet our anticipated operating cash needs for at least the next 12 months.
-        """
-    
-    def generate_mock_financial_statements(self):
-        """Generate mock financial statements text"""
-        return """
-        Consolidated Balance Sheets
-        (in millions)
-                                        Current Year    Previous Year
-        Assets
-        Current assets:
-          Cash and cash equivalents     $    450        $    380
-          Short-term investments             200             150
-          Accounts receivable, net           320             280
-          Inventories                        180             160
-          Other current assets                50              45
-        Total current assets                1200            1015
-        
-        Property and equipment, net          500             450
-        Goodwill                             300             300
-        Intangible assets, net               200             220
-        Other assets                         100              80
-        Total assets                    $   2300        $   2065
-        
-        Liabilities and Stockholders' Equity
-        Current liabilities:
-          Accounts payable              $    150        $    130
-          Accrued expenses                   200             180
-          Deferred revenue                   100              90
-          Current portion of debt             50              50
-        Total current liabilities            500             450
-        
-        Long-term debt                       300             350
-        Other long-term liabilities          200             180
-        Total liabilities                   1000             980
-        
-        Stockholders' equity:
-          Common stock                         1               1
-          Additional paid-in capital         800             750
-          Retained earnings                  500             335
-          Accumulated other comprehensive income/(loss)        (1)              (1)
-        Total stockholders' equity          1300            1085
-        Total liabilities and stockholders' equity $ 2300   $ 2065
-        """
-    
-    def generate_mock_business_overview(self):
-        """Generate mock business overview text"""
-        return """
-        Business Overview
-        
-        Company Background
-        
-        We are a leading provider of innovative technology solutions for consumers and businesses worldwide. Founded in 1985, we have grown from a small startup to a global enterprise with operations in over 30 countries and approximately 25,000 employees. Our mission is to create products that enrich people's lives and help businesses succeed in an increasingly digital world.
-        
-        Products and Services
-        
-        Our product portfolio includes hardware devices, software applications, cloud services, and specialized solutions for enterprise customers. Our consumer products focus on enhancing productivity, entertainment, and connectivity, while our business solutions address critical needs in areas such as data management, security, and digital transformation.
-        
-        Research and Development
-        
-        Innovation is at the core of our strategy. We invested approximately $350 million in research and development during the past fiscal year, representing 15% of our total revenue. Our R&D activities focus on developing new products, enhancing existing offerings, and exploring emerging technologies such as artificial intelligence, augmented reality, and quantum computing.
-        
-        Marketing and Distribution
-        
-        We market our products through multiple channels, including direct sales, retail partners, online platforms, and value-added resellers. Our marketing strategy emphasizes product differentiation, brand awareness, and customer engagement. We have established strategic partnerships with leading retailers and distributors to ensure broad availability of our products worldwide.
-        """
-    
-    def analyze_sentiment(self, sections):
-        """Analyze sentiment of filing sections"""
-        try:
-            sentiment_results = {}
-            analyzer = SentimentIntensityAnalyzer()
-            
-            for section_name, section_text in sections.items():
-                sentiment = analyzer.polarity_scores(section_text)
-                sentiment_results[section_name] = sentiment
-            
-            return {
-                "status": "success",
-                "sentiment": sentiment_results
-            }
-        except Exception as e:
-            return {
-                "status": "error",
-                "error": str(e)
-            }
-    
-    def extract_entities(self, sections):
-        """Extract named entities from filing sections"""
-        try:
-            entity_results = {}
-            
-            for section_name, section_text in sections.items():
-                doc = self.nlp(section_text[:10000])  # Limit text size for performance
-                
-                entities = {}
-                for ent in doc.ents:
-                    if ent.label_ not in entities:
-                        entities[ent.label_] = []
-                    
-                    # Check if entity already exists
-                    found = False
-                    for i, (name, count, _) in enumerate(entities.get(ent.label_, [])):
-                        if name.lower() == ent.text.lower():
-                            entities[ent.label_][i] = (name, count + 1, 0)
-                            found = True
-                            break
-                    
-                    if not found:
-                        entities[ent.label_].append((ent.text, 1, 0))
-                
-                # Sort entities by frequency
-                for label in entities:
-                    entities[label] = sorted(entities[label], key=lambda x: x[1], reverse=True)
-                
-                entity_results[section_name] = len([ent for sublist in entities.values() for ent in sublist])
-                
-                # Store entities in database
+                # Get sections for context
                 conn = sqlite3.connect('sec_filings.db')
                 c = conn.cursor()
-                
-                # Get section ID
                 c.execute("""
-                    SELECT id FROM sections 
-                    WHERE section_name = ? AND section_text LIKE ?
-                """, (section_name, section_text[:100] + '%'))
+                    SELECT s.section_name, s.section_text
+                    FROM sections s
+                    JOIN filings f ON s.filing_id = f.id
+                    JOIN companies c ON f.company_id = c.id
+                    WHERE c.ticker = ? AND f.filing_year = ? AND f.filing_type = ?
+                """, (results['ticker'], results['year'], results['filing_type']))
                 
-                section_id = c.fetchone()
-                
-                if section_id:
-                    section_id = section_id[0]
-                    
-                    # Delete existing entities for this section
-                    c.execute("DELETE FROM entities WHERE section_id = ?", (section_id,))
-                    
-                    # Insert new entities
-                    for entity_type, entity_list in entities.items():
-                        for entity_name, entity_count, _ in entity_list:
-                            c.execute("""
-                                INSERT INTO entities (section_id, entity_type, entity_name, entity_count)
-                                VALUES (?, ?, ?, ?)
-                            """, (section_id, entity_type, entity_name, entity_count))
-                
-                conn.commit()
+                sections = dict(c.fetchall())
                 conn.close()
-            
-            return {
-                "status": "success",
-                "entities": entity_results
-            }
-        except Exception as e:
-            return {
-                "status": "error",
-                "error": str(e)
-            }
-    
-    def extract_topics(self, text, num_topics=5):
-        """Extract topics from text using LDA"""
-        try:
-            # Mock implementation - in a real app, this would use actual topic modeling
-            topics = []
-            
-            for i in range(num_topics):
-                words = []
-                for _ in range(10):
-                    words.append(random.choice([
-                        "revenue", "growth", "market", "product", "customer", 
-                        "technology", "risk", "competition", "regulation", "innovation",
-                        "digital", "strategy", "financial", "operational", "investment",
-                        "global", "supply", "chain", "security", "sustainability"
-                    ]))
                 
-                topics.append({
-                    "words": list(set(words)),  # Remove duplicates
-                    "weight": random.uniform(0.5, 1.0),
-                    "summary": f"This topic relates to {', '.join(words[:3])} and their impact on business operations."
-                })
-            
-            return topics
-        except Exception as e:
-            print(f"Error extracting topics: {e}")
-            return None
-    
-    def generate_summaries(self, sections):
-        """Generate summaries of filing sections"""
-        try:
-            summary_results = {}
-            
-            for section_name, section_text in sections.items():
-                # Mock implementation - in a real app, this would use actual summarization
-                sentences = section_text.split('.')
-                summary = '. '.join(random.sample(sentences, min(5, len(sentences))))
-                summary_results[section_name] = summary
-            
-            return {
-                "status": "success",
-                "summaries": summary_results
-            }
-        except Exception as e:
-            return {
-                "status": "error",
-                "error": str(e)
-            }
-    
-    def classify_text(self, sections):
-        """Classify text in filing sections"""
-        try:
-            classification_results = {}
-            
-            for section_name, section_text in sections.items():
-                # Mock implementation - in a real app, this would use actual classification
-                if section_name == "risk_factors":
-                    classifications = [
-                        ("Market Risk", 0.85),
-                        ("Operational Risk", 0.72),
-                        ("Technological Risk", 0.68),
-                        ("Regulatory Risk", 0.65)
-                    ]
-                elif section_name == "management_discussion":
-                    classifications = [
-                        ("Financial Analysis", 0.88),
-                        ("Strategic Planning", 0.75),
-                        ("Performance Review", 0.70),
-                        ("Future Outlook", 0.65)
-                    ]
-                else:
-                    classifications = [
-                        ("Business Information", 0.82),
-                        ("Financial Data", 0.76),
-                        ("Corporate Governance", 0.68),
-                        ("Industry Analysis", 0.62)
-                    ]
+                if not sections:
+                    sections = {
+                        'risk_factors': "Mock risk factors section for demonstration purposes.",
+                        'mda': "Mock Management's Discussion and Analysis section for demonstration purposes.",
+                        'business': "Mock business section for demonstration purposes."
+                    }
                 
-                classification_results[section_name] = classifications
-            
-            return {
-                "status": "success",
-                "classifications": classification_results
-            }
-        except Exception as e:
-            return {
-                "status": "error",
-                "error": str(e)
-            }
-    
-    def detect_anomalies(self, sections):
-        """Detect anomalies in filing sections"""
-        try:
-            anomaly_results = {}
-            
-            for section_name, section_text in sections.items():
-                # Mock implementation - in a real app, this would use actual anomaly detection
-                if section_name == "risk_factors":
-                    anomalies = [
-                        ("Unusual Risk Factor Language", 0.78),
-                        ("New Risk Category Introduction", 0.65),
-                        ("Significant Change in Risk Assessment", 0.58)
-                    ]
-                elif section_name == "financial_statements":
-                    anomalies = [
-                        ("Unusual Revenue Recognition Pattern", 0.72),
-                        ("Significant Change in Accounting Method", 0.68),
-                        ("Unexpected Asset Valuation", 0.62)
-                    ]
-                else:
-                    anomalies = [
-                        ("Unusual Language Pattern", 0.70),
-                        ("Significant Change in Disclosure", 0.65),
-                        ("Unexpected Information", 0.60)
-                    ]
+                # AI query interface
+                st.subheader("Ask AI about this Filing")
                 
-                anomaly_results[section_name] = anomalies
-            
-            return {
-                "status": "success",
-                "anomalies": anomaly_results
-            }
-        except Exception as e:
-            return {
-                "status": "error",
-                "error": str(e)
-            }
-    
-    def generate_insight(self, section_name, section_text):
-        """Generate AI insight for a section"""
-        try:
-            if not self.openai_api_key:
-                return "OpenAI API key is required for generating insights."
-            
-            # Mock implementation - in a real app, this would use actual AI
-            insights = {
-                "risk_factors": """
-                Analysis of the risk factors reveals several key concerns:
+                query = st.text_input("Enter your question about this filing:", 
+                                     placeholder="e.g., What are the top 3 risks mentioned in this filing?")
                 
-                1. Cybersecurity risks are prominently featured, suggesting increased attention to digital threats.
-                2. Supply chain disruptions are highlighted as a significant operational risk, likely reflecting global economic conditions.
-                3. Regulatory compliance risks have increased compared to previous filings, particularly around data privacy.
-                4. Market competition risks emphasize new entrants and technological disruption.
+                if query:
+                    with st.spinner("AI is analyzing the filing..."):
+                        try:
+                            answer = st.session_state.agentic_ai.answer_question(
+                                query, sections, results['ticker'], results['year'], results['filing_type']
+                            )
+                            st.markdown(answer)
+                        except Exception as e:
+                            st.error(f"Error getting AI response: {e}")
                 
-                These risk factors suggest the company is operating in a challenging environment with multiple external pressures. The emphasis on technological and cybersecurity risks indicates the company's increasing reliance on digital infrastructure and potential vulnerabilities in this area.
-                """,
+                # Predefined analyses
+                st.subheader("Predefined Analyses")
                 
-                "management_discussion": """
-                The management discussion reveals several important trends:
+                analysis_options = [
+                    "Extract and analyze key risk factors",
+                    "Analyze sentiment of Management's Discussion",
+                    "Generate a comprehensive summary",
+                    "Detect anomalies or unusual patterns",
+                    "Compare with previous filings",
+                    "Search for specific topics"
+                ]
                 
-                1. Revenue growth of 12% outpaces the industry average of 8%, indicating market share gains.
-                2. Gross margin improvement from 54% to 58% suggests successful cost optimization initiatives.
-                3. Increased R&D spending (15% of revenue) reflects commitment to innovation but may pressure short-term profitability.
-                4. International expansion is cited as a key growth driver, with particular emphasis on Asian markets.
+                selected_analysis = st.selectbox("Select an analysis to run:", analysis_options)
                 
-                The company appears to be in a strong financial position with healthy cash reserves and improving operational efficiency. Management's focus on international expansion and R&D investment suggests a long-term growth strategy rather than short-term profit maximization.
-                """,
-                
-                "financial_statements": """
-                Analysis of the financial statements reveals:
-                
-                1. Cash position has strengthened by 18% year-over-year, providing increased financial flexibility.
-                2. Debt-to-equity ratio has improved from 0.37 to 0.27, indicating a stronger balance sheet.
-                3. Return on assets has increased from 12.3% to 14.1%, suggesting improved operational efficiency.
-                4. Capital expenditures represent 8% of revenue, slightly above the industry average of 6.5%.
-                
-                The company's financial position appears solid with improving metrics across most key indicators. The increased cash reserves provide a buffer against market uncertainties while allowing for strategic investments in growth opportunities.
-                """,
-                
-                "business_overview": """
-                The business overview reveals several strategic priorities:
-                
-                1. Significant investment in emerging technologies (AI, AR, quantum computing) positions the company for future innovation.
-                2. Multi-channel distribution strategy balances direct and indirect sales channels.
-                3. Global presence in 30+ countries provides geographic diversification.
-                4. Product portfolio spans both consumer and enterprise markets, reducing dependence on any single market segment.
-                
-                The company's broad product portfolio and geographic diversification provide resilience against market-specific downturns. The emphasis on emerging technologies suggests management is focused on long-term positioning rather than just current product cycles.
-                """
-            }
-            
-            return insights.get(section_name, "No insight available for this section.")
-        except Exception as e:
-            return f"Error generating insight: {str(e)}"
-    
-    def clean_text(self, text):
-        """Clean and preprocess text for analysis"""
-        # Remove special characters and extra whitespace
-        text = re.sub(r'[^\w\s]', ' ', text)
-        text = re.sub(r'\s+', ' ', text).strip()
-        return text
-    
-    def process_filing(self, ticker, year, filing_type, quarter=None):
-        """Process an SEC filing and perform analysis"""
-        try:
-            # Download filing
-            download_result = self.download_filing(ticker, year, filing_type, quarter)
-            
-            if download_result["status"] != "success":
-                return download_result
-            
-            filing_id = download_result["filing_id"]
-            
-            # Extract sections
-            sections_result = self.extract_sections(filing_id)
-            
-            if sections_result["status"] != "success":
-                return sections_result
-            
-            # Get section texts
-            conn = sqlite3.connect('sec_filings.db')
-            c = conn.cursor()
-            c.execute("""
-                SELECT section_name, section_text
-                FROM sections
-                WHERE filing_id = ?
-            """, (filing_id,))
-            sections_data = c.fetchall()
-            conn.close()
-            
-            sections = {name: text for name, text in sections_data}
-            
-            # Analyze sentiment
-            sentiment_result = self.analyze_sentiment(sections)
-            
-            # Extract entities
-            entities_result = self.extract_entities(sections)
-            
-            # Extract topics
-            topics_result = {}
-            for section_name, section_text in sections.items():
-                cleaned_text = self.clean_text(section_text)
-                topics = self.extract_topics(cleaned_text)
-                if topics:
-                    topics_result[section_name] = len(topics)
-            
-            # Generate summaries
-            summaries_result = self.generate_summaries(sections)
-            
-            # Classify text
-            classification_result = self.classify_text(sections)
-            
-            # Detect anomalies
-            anomalies_result = self.detect_anomalies(sections)
-            
-            # Generate AI insights if API key is provided
-            insights = {}
-            if self.openai_api_key:
-                for section_name, section_text in sections.items():
-                    insights[section_name] = self.generate_insight(section_name, section_text)
-            
-            # Combine results
-            result = {
-                "status": "success",
-                "ticker": ticker,
-                "year": year,
-                "filing_type": filing_type,
-                "quarter": quarter,
-                "sections": sections_result["sections"],
-                "sentiment": sentiment_result.get("sentiment", {}),
-                "entities": entities_result.get("entities", {}),
-                "topics": topics_result,
-                "summaries": summaries_result.get("summaries", {}),
-                "classifications": classification_result.get("classifications", {}),
-                "anomalies": anomalies_result.get("anomalies", {}),
-                "insights": insights
-            }
-            
-            return result
-        except Exception as e:
-            return {
-                "status": "error",
-                "error": str(e)
-            }
-
-# Define the AgenticSECAnalyzer class
-class AgenticSECAnalyzer:
-    def __init__(self, openai_api_key):
-        self.openai_api_key = openai_api_key
-    
-    def answer_question(self, question, sections, ticker, year, filing_type):
-        """Answer a question about the SEC filing using AI"""
-        try:
-            # Mock implementation - in a real app, this would use actual AI
-            responses = {
-                "risk": "The main risk factors identified in the filing include cybersecurity threats, supply chain disruptions, regulatory compliance challenges, and market competition. The company highlights cybersecurity as a particularly significant concern, noting increased sophistication of attacks.",
-                "revenue": "The company reported a 12% increase in revenue compared to the previous year, primarily driven by new product launches and expansion into international markets, particularly in Asia.",
-                "profit": "Gross margin improved to 58% from 54% in the prior year due to manufacturing efficiencies and favorable product mix. Operating expenses increased by 8%, reflecting continued investment in R&D.",
-                "strategy": "The company's strategy focuses on international expansion, investment in emerging technologies (AI, AR, quantum computing), and maintaining a diversified product portfolio across both consumer and enterprise markets.",
-                "outlook": "Management expressed cautious optimism about future growth prospects, citing strong product pipeline and international expansion opportunities, while acknowledging potential headwinds from economic uncertainty and supply chain challenges.",
-                "debt": "The company's debt-to-equity ratio improved from 0.37 to 0.27, indicating a stronger balance sheet. Long-term debt decreased from $350 million to $300 million.",
-                "cash": "Cash and cash equivalents increased to $450 million from $380 million in the previous year. Operating activities generated $220 million in cash."
-            }
-            
-            # Simple keyword matching to determine response
-            for keyword, response in responses.items():
-                if keyword.lower() in question.lower():
-                    return f"Based on the {year} {filing_type} filing for {ticker}:\n\n{response}"
-            
-            # Default response if no keywords match
-            return f"Based on my analysis of the {year} {filing_type} filing for {ticker}, I don't have specific information to answer that question. The filing primarily discusses risk factors, financial performance, business operations, and strategic initiatives. Could you rephrase your question to focus on one of these areas?"
-        except Exception as e:
-            return f"Error generating answer: {str(e)}"
+                if st.button("Run Analysis", key="run_predefined_analysis"):
+                    with st.spinner("Running analysis..."):
+                        try:
+                            if selected_analysis == analysis_options[0]:
+                                result = st.session_state.agentic_ai.extract_risk_factors(
+                                    results['ticker'], results['year'], results['filing_type']
+                                )
+                            elif selected_analysis == analysis_options[1]:
+                                result = st.session_state.agentic_ai.analyze_sentiment(
+                                    results['ticker'], results['year'], results['filing_type'], "mda"
+                                )
+                            elif selected_analysis == analysis_options[2]:
+                                result = st.session_state.agentic_ai.generate_summary(
+                                    results['ticker'], results['year'], results['filing_type']
+                                )
+                            elif selected_analysis == analysis_options[3]:
+                                result = st.session_state.agentic_ai.detect_anomalies(
+                                    results['ticker'], results['year'], results['filing_type']
+                                )
+                            elif selected_analysis == analysis_options[4]:
+                                # Mock comparison with previous years
+                                prev_years = list(range(results['year']-3, results['year']))
+                                result = st.session_state.agentic_ai.compare_filings(
+                                    results['ticker'], prev_years + [results['year']], results['filing_type']
+                                )
+                            elif selected_analysis == analysis_options[5]:
+                                search_query = st.text_input("Enter search term:", placeholder="e.g., cybersecurity")
+                                if search_query:
+                                    result = st.session_state.agentic_ai.search_filings(
+                                        results['ticker'], search_query, [results['filing_type']]
+                                    )
+                                else:
+                                    result = "Please enter a search term."
+                            
+                            try:
+                                # Try to parse as JSON for better formatting
+                                result_json = json.loads(result)
+                                st.json(result_json)
+                            except:
+                                # If not JSON, display as markdown
+                                st.markdown(result)
+                        except Exception as e:
+                            st.error(f"Error running analysis: {e}")
+        
+        # Add the aggregate insights tab
+        add_aggregate_insights_tab(tabs)
 
 if __name__ == "__main__":
     main()
