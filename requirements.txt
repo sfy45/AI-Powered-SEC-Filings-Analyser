@@ -20,9 +20,9 @@ spacy==3.6.1
 vaderSentiment==3.3.2
 transformers==4.31.0
 sentence-transformers==2.2.2
+huggingface_hub==0.20.3
 langchain>=0.1.0,<0.2.0
 langchain-openai==0.0.2
-
 
 # SEC data retrieval
 sec-edgar-downloader==4.3.0
@@ -41,6 +41,7 @@ SQLAlchemy==2.0.19
 # Visualization
 pyvis==0.3.2
 networkx==3.1
+uuid
 
 # PDF generation
 fpdf2==2.7.8
