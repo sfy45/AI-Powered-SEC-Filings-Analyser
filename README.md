@@ -16,10 +16,17 @@ An AI-powered tool for extracting, analyzing, and visualizing insights from SEC 
 - **Interactive Visualizations**: Charts, graphs, and network diagrams
 - **Agentic AI**: Ask questions about filings and get AI-powered answers
 - **PDF Report Generation**: Export analysis results as PDF reports
+- **Aggregate Insights** :  Analyze trends across multiple companies and years using:
+  - Aggregate sentiment charts
+  - Risk heatmaps
+  - Topic radar plots
+  - Company similarity heatmaps
+  - Year-over-year comparison graphs
+  - Comparative risk factor tables
 
 
 ## 🌐 Demo
-🔗 **Live App:** [AI-Powered-SEC-Filings-Analyser](https://huggingface.co/spaces/sfy45/AI-Powered-SEC-Filings-Analyser)
+🔗 **Live App:** [AI-Powered-SEC-Filings-Analyser](https://huggingface.co/spaces/sfy45/SEC-FILINGS-INSIGHTS-EXTRACTION-WITH-AI)
 
 ## Setup
 
